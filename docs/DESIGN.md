@@ -187,10 +187,10 @@ sequenceDiagram
         Note over Orch: commit() into "sim" layer → render latest
     end
     Sim--xOrch: terminate (stream EOF)
-    Note over Orch: last snapshot HELD on screen; viz lives on
+    Note over Orch: last snapshot HELD on screen — viz lives on
     User->>Orch: attach telemetry
     Ops-->>Orch: wire stream (different socket)
-    Note over Orch: same reader → "telemetry" layer;<br/>"bodies" layer fills reference bodies
+    Note over Orch: same reader → "telemetry" layer,<br/>"bodies" layer fills reference bodies
 ```
 
 - **Sims run as separate processes.** The orchestrator spawns one and reads the

@@ -1,0 +1,10 @@
+[package]
+name = "astrotui-render-graphics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Graphics-protocol (sixel/kitty/iTerm) raster rendering backend for astrotui."
+
+[dependencies]
+astrotui-core = { workspace = true }

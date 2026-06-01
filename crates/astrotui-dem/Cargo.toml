@@ -1,0 +1,11 @@
+[package]
+name = "astrotui-dem"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "DEM ingest / tiling / LOD for astrotui terrain rendering."
+
+[dependencies]
+# astrodyn_planet (body shape) is wired in #8; the pipeline lands in P2, gated by the
+# DEM design doc (#41).

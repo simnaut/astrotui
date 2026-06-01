@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/astrotui-core",
+    "crates/astrotui-render-braille",
+    "crates/astrotui-render-color",
+    "crates/astrotui-render-graphics",
+    "crates/astrotui-wire",
+    "crates/astrotui-dem",
+    "apps/orchestrator",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.94"
+repository = "https://github.com/simnaut/astrotui"
+
+[workspace.dependencies]
+# Internal crates (path-wired; the §9 dependency graph).
+astrotui-core = { path = "crates/astrotui-core" }
+astrotui-render-braille = { path = "crates/astrotui-render-braille" }
+astrotui-render-color = { path = "crates/astrotui-render-color" }
+astrotui-render-graphics = { path = "crates/astrotui-render-graphics" }
+astrotui-wire = { path = "crates/astrotui-wire" }
+astrotui-dem = { path = "crates/astrotui-dem" }
+
+# Third-party. ratatui is added to astrotui-core via `cargo add` (latest stable).
+# The astrodyn_* crates (astrodyn_frames / _quantities / _planet) are wired in #8,
+# which owns the source/pin decision; intentionally absent from this scaffold so it
+# compiles standalone.

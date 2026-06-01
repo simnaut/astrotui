@@ -1,0 +1,10 @@
+[package]
+name = "astrotui-render-braille"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Monochrome braille-dot rendering backend for astrotui (the capability floor)."
+
+[dependencies]
+astrotui-core = { workspace = true }

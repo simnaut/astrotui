@@ -1,0 +1,12 @@
+[package]
+name = "astrotui-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Source-agnostic rendering core for astrotui: widget, Camera, SceneStore/SceneWriter, Renderer trait, projection/LOD. Links no Bevy and no ANISE/ephemeris."
+
+[dependencies]
+ratatui = "0.30.0"
+# astrodyn_frames / astrodyn_quantities / astrodyn_planet are wired in #8 (which owns
+# the source/pin decision); intentionally absent here so the scaffold compiles standalone.

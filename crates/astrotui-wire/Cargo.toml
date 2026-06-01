@@ -1,0 +1,11 @@
+[package]
+name = "astrotui-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Self-describing scene wire codec (header + frame-tagged samples) for astrotui: socket streams and replay files."
+
+[dependencies]
+# astrodyn_quantities (serde feature) + the encoding deps are wired with the codec
+# itself in #21; binary framing decided in #36.

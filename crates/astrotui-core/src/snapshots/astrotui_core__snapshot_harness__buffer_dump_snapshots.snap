@@ -1,0 +1,7 @@
+---
+source: crates/astrotui-core/src/lib.rs
+expression: buffer_to_text(&buf)
+---
+astro 
+      
+ tui

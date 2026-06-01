@@ -13,5 +13,13 @@ astrodyn_frames = { workspace = true }
 astrodyn_quantities = { workspace = true }
 astrodyn_planet = { workspace = true }
 
+[features]
+# Exposes `astrotui_core::testing` (e.g. buffer_to_text) to downstream crates'
+# dev-dependencies for golden-frame snapshot tests.
+testing = []
+
+[dev-dependencies]
+insta = "1"
+
 [lints]
 workspace = true

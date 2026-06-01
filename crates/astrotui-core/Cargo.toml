@@ -8,5 +8,6 @@ description = "Source-agnostic rendering core for astrotui: widget, Camera, Scen
 
 [dependencies]
 ratatui = "0.30.0"
-# astrodyn_frames / astrodyn_quantities / astrodyn_planet are wired in #8 (which owns
-# the source/pin decision); intentionally absent here so the scaffold compiles standalone.
+astrodyn_frames = { workspace = true }
+astrodyn_quantities = { workspace = true }
+astrodyn_planet = { workspace = true }

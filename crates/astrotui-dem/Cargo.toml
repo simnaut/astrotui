@@ -7,5 +7,5 @@ repository.workspace = true
 description = "DEM ingest / tiling / LOD for astrotui terrain rendering."
 
 [dependencies]
-# astrodyn_planet (body shape) is wired in #8; the pipeline lands in P2, gated by the
-# DEM design doc (#41).
+astrodyn_planet = { workspace = true }
+# The DEM pipeline lands in P2, gated by the design doc (#41).

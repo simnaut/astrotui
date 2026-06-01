@@ -7,5 +7,6 @@ repository.workspace = true
 description = "Self-describing scene wire codec (header + frame-tagged samples) for astrotui: socket streams and replay files."
 
 [dependencies]
-# astrodyn_quantities (serde feature) + the encoding deps are wired with the codec
-# itself in #21; binary framing decided in #36.
+astrodyn_quantities = { workspace = true }
+# The non-default `serde` feature + encoding deps are enabled with the codec in #21;
+# binary framing decided in #36.

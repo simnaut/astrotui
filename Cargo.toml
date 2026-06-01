@@ -25,7 +25,11 @@ astrotui-render-graphics = { path = "crates/astrotui-render-graphics" }
 astrotui-wire = { path = "crates/astrotui-wire" }
 astrotui-dem = { path = "crates/astrotui-dem" }
 
-# Third-party. ratatui is added to astrotui-core via `cargo add` (latest stable).
-# The astrodyn_* crates (astrodyn_frames / _quantities / _planet) are wired in #8,
-# which owns the source/pin decision; intentionally absent from this scaffold so it
-# compiles standalone.
+# astrodyn substrate — pinned by git rev for reproducibility (#8). The pure,
+# Bevy-free, ANISE-free trio. astrodyn_ephemeris is intentionally NOT pinned here:
+# it enters only through producers, never the render core (DESIGN.md §12 firewall).
+astrodyn_frames = { git = "https://github.com/simnaut/astrodyn", rev = "0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb" }
+astrodyn_quantities = { git = "https://github.com/simnaut/astrodyn", rev = "0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb" }
+astrodyn_planet = { git = "https://github.com/simnaut/astrodyn", rev = "0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb" }
+
+# ratatui lives in astrotui-core's own manifest (added via `cargo add`).

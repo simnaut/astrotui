@@ -314,11 +314,15 @@ impl Transaction {
     /// Atomically replace this layer's contents with the staged set and republish the
     /// union snapshot. Other layers are untouched.
     pub fn commit(self) {
+        // Recover from a poisoned lock rather than propagating the panic: a producer
+        // panicking mid-commit must not permanently wedge a long-lived store. The guarded
+        // data is only the layer map, and this commit fully replaces its layer and
+        // rebuilds the union, so continuing from a poisoned state is safe.
         let mut layers = self
             .inner
             .layers
             .lock()
-            .expect("scene layers mutex poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         layers.insert(self.layer_id, self.staged);
         let snapshot = Inner::rebuild(&layers);
         self.inner.published.store(Arc::new(snapshot));

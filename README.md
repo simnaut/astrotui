@@ -20,3 +20,26 @@ look the same to the widget.
 
 See **[docs/DESIGN.md](docs/DESIGN.md)** for the full architecture (diagrams
 included).
+
+## Development
+
+The build is a cargo workspace; the crate layout follows DESIGN.md §9. Common
+commands:
+
+```sh
+cargo build --workspace
+cargo test --workspace
+cargo clippy --all-targets --workspace -- -D warnings
+cargo fmt --all
+```
+
+Work is tracked as a phased roadmap on the GitHub project, with issues gated by
+`blocked-by` dependencies. Every pull request must pass three required checks
+before it can merge to `main`:
+
+- **test** — `fmt --check`, `clippy -D warnings`, `build`, `test`
+- **firewall** — proves `astrotui-core` links no Bevy and no ANISE/ephemeris
+- **claude-review** — an automated rigorous code review; its inline findings
+  must be resolved before merge
+
+`main` is squash-only and takes no direct pushes.

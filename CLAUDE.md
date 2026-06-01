@@ -12,7 +12,7 @@ change). Cite the relevant `§` when implementing.
 
 `astrotui-core` and every `astrotui-render-*` crate link **no Bevy** and **no
 ANISE/ephemeris**. Those live only in *producers* that are external to the render core:
-the sim-side exporter / `apps/refsim`, and the ephemeris body-filler. The substrate is
+the sim-side exporter (the planned `apps/refsim`, P3) and the ephemeris body-filler. The substrate is
 the pure astrodyn crates only — `astrodyn_frames`, `astrodyn_quantities`,
 `astrodyn_planet` — pinned by git rev in `[workspace.dependencies]`. CI's `firewall` job
 enforces this on every PR.
@@ -34,7 +34,7 @@ enforces this on every PR.
 ## Build & merge gate
 
 ```sh
-cargo fmt --all
+cargo fmt --all --check   # CI runs --check; drop --check locally to auto-format
 cargo clippy --all-targets --workspace -- -D warnings
 cargo test --workspace
 ```

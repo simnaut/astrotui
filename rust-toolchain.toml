@@ -1,0 +1,5 @@
+[toolchain]
+# Floats on stable; the workspace MSRV floor is pinned via `rust-version` in
+# the root Cargo.toml ([workspace.package]).
+channel = "stable"
+components = ["rustfmt", "clippy"]

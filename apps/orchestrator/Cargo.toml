@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 description = "Reference host for astrotui: configure/launch a sim, observe it live, replay logs, or listen to telemetry."
 
 [dependencies]
@@ -13,3 +14,6 @@ astrotui-render-color = { workspace = true }
 astrotui-render-graphics = { workspace = true }
 astrotui-wire = { workspace = true }
 astrotui-dem = { workspace = true }
+
+[lints]
+workspace = true

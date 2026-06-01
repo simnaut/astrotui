@@ -4,8 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 description = "DEM ingest / tiling / LOD for astrotui terrain rendering."
 
 [dependencies]
 astrodyn_planet = { workspace = true }
 # The DEM pipeline lands in P2, gated by the design doc (#41).
+
+[lints]
+workspace = true

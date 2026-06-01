@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 description = "Self-describing scene wire codec (header + frame-tagged samples) for astrotui: socket streams and replay files."
 
 [dependencies]
 astrodyn_quantities = { workspace = true }
 # The non-default `serde` feature + encoding deps are enabled with the codec in #21;
 # binary framing decided in #36.
+
+[lints]
+workspace = true

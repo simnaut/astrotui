@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
+license.workspace = true
 description = "24-bit color half-block rendering backend for astrotui (dithered shading)."
 
 [dependencies]
 astrotui-core = { workspace = true }
+
+[lints]
+workspace = true

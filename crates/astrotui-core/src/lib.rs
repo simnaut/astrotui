@@ -5,6 +5,11 @@
 //! (§2, §12) this crate links **no Bevy** and **no ANISE/ephemeris** — it renders the
 //! states it is given. Implementation lands in P0 and later.
 
+/// Test-only helpers (golden-frame snapshots). Available in this crate's tests and,
+/// for downstream crates, via the `testing` feature.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 #[cfg(test)]
 mod astrodyn_surface {
     //! Compile/link verification that the pinned astrodyn substrate (#8, post-#645)
@@ -40,5 +45,21 @@ mod astrodyn_surface {
         assert_eq!(black_box(MOON.name), "Moon");
         assert!(black_box(MOON.r_eq()) >= black_box(MOON.r_pol()));
         assert!(black_box(MOON.mu) > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_harness {
+    //! Seeds the golden-frame snapshot mechanism (insta + `buffer_to_text`) that
+    //! P0+ render tests build on.
+    use crate::testing::buffer_to_text;
+    use ratatui::{buffer::Buffer, layout::Rect, style::Style};
+
+    #[test]
+    fn buffer_dump_snapshots() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 3));
+        buf.set_string(0, 0, "astro", Style::default());
+        buf.set_string(1, 2, "tui", Style::default());
+        insta::assert_snapshot!(buffer_to_text(&buf));
     }
 }

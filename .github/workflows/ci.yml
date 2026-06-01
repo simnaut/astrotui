@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets --workspace -- -D warnings
+      - name: build
+        run: cargo build --workspace --verbose
+      - name: test
+        run: cargo test --workspace --verbose
+
+  firewall:
+    name: firewall
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: astrotui-core links no Bevy and no ANISE/ephemeris
+        run: |
+          tree=$(cargo tree -p astrotui-core --edges normal --prefix none)
+          echo "$tree"
+          if echo "$tree" | grep -iqE '^(bevy|bevy_[a-z_]+|anise|astrodyn_bevy|astrodyn_ephemeris) '; then
+            echo "::error::astrotui-core depends on a forbidden crate (Bevy/ANISE/ephemeris) — see DESIGN.md §12 firewall"
+            exit 1
+          fi
+          echo "firewall OK: astrotui-core dependency tree is Bevy-free and ANISE-free"

@@ -35,9 +35,12 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
-          # --comment posts findings as inline review threads, which block merge via
-          # the repo's required conversation resolution.
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} --comment'
+          # high effort + Opus for a deeper review (catches subtler correctness/
+          # concurrency issues); --comment posts findings as inline review threads, which
+          # block merge via the repo's required conversation resolution. Project-specific
+          # criteria (firewall, design fidelity, etc.) come from the repo CLAUDE.md.
+          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }} high --comment'
+          claude_args: '--model claude-opus-4-8'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 

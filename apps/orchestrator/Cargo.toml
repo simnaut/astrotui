@@ -1,0 +1,15 @@
+[package]
+name = "orchestrator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Reference host for astrotui: configure/launch a sim, observe it live, replay logs, or listen to telemetry."
+
+[dependencies]
+astrotui-core = { workspace = true }
+astrotui-render-braille = { workspace = true }
+astrotui-render-color = { workspace = true }
+astrotui-render-graphics = { workspace = true }
+astrotui-wire = { workspace = true }
+astrotui-dem = { workspace = true }

@@ -24,9 +24,11 @@ GitHub — never assume memory from a prior run.
   PATCH (`gh pr edit` fails on this repo).
 - **Merge gate:** `main` is protected (squash-only, no direct pushes, enforced for
   admins) and requires three status checks green before merge — `test`, `firewall`, and
-  `review`. `review` is the rigorous review gate (Phase A below); this loop sets it on the
-  PR head commit only after an independent review comes back clean. Never bypass with
-  `gh pr merge --admin`.
+  `claude-review`. `claude-review` is an **independent CI review** (the `Claude Code
+  Review` workflow) that runs automatically on every PR and posts findings as inline
+  review threads; those threads must be resolved before merge (required conversation
+  resolution). This loop does NOT self-review — it responds to the CI review (Phase A).
+  Never bypass with `gh pr merge --admin`.
 
 ## Selection order ("earliest")
 1. Restrict to the **earliest phase (milestone)** that still has any open
@@ -44,28 +46,20 @@ GitHub — never assume memory from a prior run.
      diagnose, fix, run `cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test`
      locally, commit (with the `Co-Authored-By` trailer) and push. If checks are only
      PENDING, leave the PR for a later cycle.
-   - **Rigorous review gate:** once `test`+`firewall` are green, before merging, run an
-     INDEPENDENT, rigorous review of the PR diff — use the `code-review` skill at high
-     effort with `--comment`, or spawn a dedicated reviewer subagent for deeper analysis.
-     Review for:
-       - **correctness** — bugs, edge cases, error handling, concurrency/ordering;
-       - **design fidelity** — matches `docs/DESIGN.md` and the locked decisions;
-       - **firewall** — `astrotui-core` links no Bevy/ANISE; producers stay external;
-       - **tests** — present, meaningful, and genuinely exercised (never green-washed);
-       - **quality** — no shims/hacks/dead TODOs, no needless complexity, idiomatic Rust,
-         naming + comment density matching surrounding code;
-       - **scope** — one issue, a reviewable diff.
-     If anything blocking is found: post it as PR review comments, fix it on the branch,
-     push (re-triggers CI), and re-review until clean. When the review comes back clean,
-     record the gate on the PR head commit:
-     `gh api -X POST repos/simnaut/astrotui/statuses/$(git rev-parse HEAD) -f state=success -f context=review -f description="rigorous review passed"`
-     (re-set it on the new HEAD sha after any later fix push).
-   - **Review threads:** ensure every unresolved thread (from the gate above or anywhere
-     else) is addressed on the branch and resolved via `resolveReviewThread`.
+   - **Review (independent CI):** the `Claude Code Review` workflow reviews every PR
+     automatically and emits the required `claude-review` check, posting findings as
+     inline review threads. Do NOT self-review. Instead: wait for `claude-review` to
+     finish, then **address every finding it posted** — fix on the branch and push
+     (re-triggers CI + a fresh review), or, only if a comment is a genuine false
+     positive, reply explaining why. Resolve each thread via `resolveReviewThread`. The
+     review covers correctness, design fidelity to `docs/DESIGN.md`, the Bevy/ANISE
+     firewall, test adequacy, code quality, and scope — treat its comments as blocking.
+   - **Review threads:** ensure every unresolved thread (from the CI review or anywhere
+     else, e.g. a human) is addressed on the branch and resolved via `resolveReviewThread`.
    - **Merge:** only when **all three required checks are green** (`test`, `firewall`,
-     `review`) AND zero unresolved threads AND the PR is mergeable → `gh pr merge <N>
-     --auto --squash` (auto-merge is enabled; GitHub merges once the gates pass). Never
-     bypass with `--admin`.
+     `claude-review`) AND zero unresolved threads AND the PR is mergeable → `gh pr merge
+     <N> --auto --squash` (auto-merge is enabled; GitHub merges once the gates pass).
+     Never bypass with `--admin`.
 3. A merged PR with `Closes #<issue>` closes its issue; set that issue's Project Status
    to **Done** if it didn't happen automatically.
 

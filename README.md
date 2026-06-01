@@ -23,8 +23,8 @@ included).
 
 ## Development
 
-The build is a cargo workspace; the crate layout follows DESIGN.md §9. Common
-commands:
+The build is a cargo workspace; the crate layout follows
+[docs/DESIGN.md](docs/DESIGN.md) §9. Common commands:
 
 ```sh
 cargo build --workspace
@@ -34,8 +34,10 @@ cargo fmt --all
 ```
 
 Work is tracked as a phased roadmap on the GitHub project, with issues gated by
-`blocked-by` dependencies. Every pull request must pass three required checks
-before it can merge to `main`:
+`blocked-by` dependencies. Every pull request must pass three required status
+checks before it can merge to `main` (GitHub Actions jobs — `test` and
+`firewall` in the **CI** workflow, `claude-review` in the **Claude Code Review**
+workflow):
 
 - **test** — `fmt --check`, `clippy -D warnings`, `build`, `test`
 - **firewall** — proves `astrotui-core` links no Bevy and no ANISE/ephemeris

@@ -6,15 +6,19 @@
 //! **union** of all layers — so each producer (a live sim, an ephemeris body-filler, a
 //! telemetry feed) has independent lifecycle and cadence without clobbering the others.
 //!
-//! This module is the ingestion machinery (issue #12). Rich object metadata (label,
-//! kind, shape, trail, path) is added in #13; building an astrodyn `FrameTree` from the
-//! frame records and the render pass land in #14.
+//! This module is the ingestion machinery (#12) plus the per-object render-metadata
+//! model (#13): a [`SceneObject`] carries id/label/frame/kind/state/shape/path. The
+//! rolling trail (DESIGN.md §4.2 `trail`) is accumulated store-side and attaches in P2
+//! (#24); building an astrodyn `FrameTree` from the frame records and the render pass
+//! land in #14.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
+use astrodyn_planet::PlanetShape;
 use astrodyn_quantities::{SecondsSince, TDB};
 use glam::{DQuat, DVec3};
 
@@ -99,18 +103,79 @@ pub struct FrameRecord {
     pub state: BodyState,
 }
 
-/// An object placed on a frame, carrying its state in that frame.
+/// What an object is, for rendering and the camera/frame switcher UI (DESIGN.md §4.2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ObjectKind {
+    /// A celestial body (planet, moon, sun).
+    Body,
+    /// A spacecraft / vehicle.
+    Spacecraft,
+    /// A fixed surface site (landing site, ground station).
+    Site,
+    /// A generic point of interest.
+    #[default]
+    Marker,
+}
+
+/// An object's physical shape. Wraps an `astrodyn_planet::PlanetShape` ellipsoid; a DEM
+/// terrain handle is added alongside the DEM pipeline in P2.
+#[derive(Clone, Copy, Debug)]
+pub struct BodyShape {
+    /// The reference ellipsoid (mean radii, mu, flattening).
+    pub ellipsoid: PlanetShape,
+}
+
+impl BodyShape {
+    /// Wrap a `PlanetShape` ellipsoid.
+    #[must_use]
+    pub fn ellipsoid(shape: PlanetShape) -> Self {
+        Self { ellipsoid: shape }
+    }
+}
+
+/// A caller-supplied planned/future polyline, in the owning object's native frame
+/// (DESIGN.md §7). Distinct from the rolling trail (accumulated past track), which lands
+/// with its store-side wiring in P2 (#24).
+#[derive(Clone, Debug, Default)]
+pub struct Path {
+    /// Polyline vertices in the object's native frame (metres).
+    pub points: Vec<DVec3>,
+}
+
+/// Per-object render metadata supplied with a state on [`Transaction::object`] — the
+/// `meta` of DESIGN.md §4.1's `tx.object(obj_id, frame_id, state, meta)`.
+#[derive(Clone, Debug, Default)]
+pub struct ObjectMeta {
+    /// Human label shown in the camera/frame switcher UI.
+    pub label: Cow<'static, str>,
+    /// What the object is.
+    pub kind: ObjectKind,
+    /// Optional physical shape (drives LOD: point → ellipsoid → DEM mesh).
+    pub shape: Option<BodyShape>,
+    /// Optional caller-supplied planned path.
+    pub path: Option<Path>,
+}
+
+/// An object placed on a frame: its state in that native frame plus render metadata.
 ///
-/// Enriched with label/kind/shape/trail/path in #13; for now it is the kinematic record
-/// the store ingests and the render pass (#14) will project.
+/// The rolling trail (`trail` in DESIGN.md §4.2) is accumulated store-side and attaches
+/// in P2 (#24); everything else in the §4.2 object model is here.
 #[derive(Clone, Debug)]
-pub struct ObjectRecord {
+pub struct SceneObject {
     /// This object's stable id.
     pub id: ObjectId,
+    /// Human label for UI enumeration.
+    pub label: Cow<'static, str>,
     /// The frame this object lives in.
     pub frame: FrameId,
+    /// What the object is.
+    pub kind: ObjectKind,
     /// State in the object's native `frame`.
     pub state: BodyState,
+    /// Optional physical shape.
+    pub shape: Option<BodyShape>,
+    /// Optional caller-supplied planned path.
+    pub path: Option<Path>,
 }
 
 /// One producer layer's committed content.
@@ -118,7 +183,7 @@ pub struct ObjectRecord {
 struct Layer {
     epoch: Option<Epoch>,
     frames: BTreeMap<FrameId, FrameRecord>,
-    objects: BTreeMap<ObjectId, ObjectRecord>,
+    objects: BTreeMap<ObjectId, SceneObject>,
 }
 
 /// An immutable, point-in-time view of the whole scene: the union of every layer's
@@ -127,7 +192,7 @@ struct Layer {
 #[derive(Debug, Default)]
 pub struct Snapshot {
     frames: Vec<FrameRecord>,
-    objects: Vec<ObjectRecord>,
+    objects: Vec<SceneObject>,
     layer_epochs: Vec<(LayerId, Epoch)>,
 }
 
@@ -140,7 +205,7 @@ impl Snapshot {
 
     /// All objects across the union of layers (ascending by id).
     #[must_use]
-    pub fn objects(&self) -> &[ObjectRecord] {
+    pub fn objects(&self) -> &[SceneObject] {
         &self.objects
     }
 
@@ -174,7 +239,7 @@ impl Inner {
     /// the same id, the layer later in `LayerId` order wins, deterministically.
     fn rebuild(layers: &BTreeMap<LayerId, Layer>) -> Snapshot {
         let mut frames: BTreeMap<FrameId, FrameRecord> = BTreeMap::new();
-        let mut objects: BTreeMap<ObjectId, ObjectRecord> = BTreeMap::new();
+        let mut objects: BTreeMap<ObjectId, SceneObject> = BTreeMap::new();
         let mut layer_epochs = Vec::new();
         for (layer_id, layer) in layers {
             if let Some(epoch) = layer.epoch {
@@ -292,20 +357,26 @@ impl Transaction {
         self
     }
 
-    /// Stage an object placed on `frame`, with `state` in that native frame.
+    /// Stage an object placed on `frame`, with `state` in that native frame and render
+    /// `meta` — DESIGN.md §4.1's `tx.object(obj_id, frame_id, state, meta)`.
     pub fn object(
         &mut self,
         id: impl Into<ObjectId>,
         frame: impl Into<FrameId>,
         state: BodyState,
+        meta: ObjectMeta,
     ) -> &mut Self {
         let id = id.into();
         self.staged.objects.insert(
             id.clone(),
-            ObjectRecord {
+            SceneObject {
                 id,
+                label: meta.label,
                 frame: frame.into(),
+                kind: meta.kind,
                 state,
+                shape: meta.shape,
+                path: meta.path,
             },
         );
         self
@@ -351,6 +422,10 @@ mod tests {
     fn secs(e: Option<Epoch>) -> Option<f64> {
         e.map(|e| e.as_seconds())
     }
+    // Default metadata for tests that don't exercise it.
+    fn m() -> ObjectMeta {
+        ObjectMeta::default()
+    }
 
     #[test]
     fn commit_publishes_frames_and_objects() {
@@ -361,7 +436,7 @@ mod tests {
         let mut tx = w.begin(ep(100.0));
         tx.frame("root", None, BodyState::default())
             .frame("moon_fixed", Some("root".into()), st(1.0))
-            .object("lander", "moon_fixed", st(2.0));
+            .object("lander", "moon_fixed", st(2.0), m());
         tx.commit();
 
         let snap = store.snapshot();
@@ -374,11 +449,11 @@ mod tests {
     fn layers_union_and_isolate() {
         let store = SceneStore::new();
         let mut tx = store.writer("sim").begin(ep(1.0));
-        tx.object("lander", "moon_fixed", st(1.0));
+        tx.object("lander", "moon_fixed", st(1.0), m());
         tx.commit();
         let mut tx = store.writer("ephemeris").begin(ep(2.0));
-        tx.object("moon", "root", st(2.0))
-            .object("earth", "root", st(3.0));
+        tx.object("moon", "root", st(2.0), m())
+            .object("earth", "root", st(3.0), m());
         tx.commit();
 
         let snap = store.snapshot();
@@ -388,7 +463,7 @@ mod tests {
 
         // Re-committing "sim" replaces only that layer; "ephemeris" persists untouched.
         let mut tx = store.writer("sim").begin(ep(5.0));
-        tx.object("orbiter", "moon_fixed", st(9.0));
+        tx.object("orbiter", "moon_fixed", st(9.0), m());
         tx.commit();
         let snap = store.snapshot();
         assert_eq!(obj_ids(&snap), ["earth", "moon", "orbiter"]); // lander gone, bodies stay
@@ -399,12 +474,13 @@ mod tests {
     fn old_snapshot_is_immutable_across_commit() {
         let store = SceneStore::new();
         let mut tx = store.writer("sim").begin(ep(1.0));
-        tx.object("a", "f", st(1.0));
+        tx.object("a", "f", st(1.0), m());
         tx.commit();
         let old = store.snapshot();
 
         let mut tx = store.writer("sim").begin(ep(2.0));
-        tx.object("a", "f", st(1.0)).object("b", "f", st(2.0));
+        tx.object("a", "f", st(1.0), m())
+            .object("b", "f", st(2.0), m());
         tx.commit();
 
         assert_eq!(obj_ids(&old), ["a"]); // previously-loaded snapshot unchanged
@@ -413,10 +489,50 @@ mod tests {
     }
 
     #[test]
+    fn object_metadata_round_trips() {
+        use astrodyn_planet::MOON;
+        let store = SceneStore::new();
+        let mut tx = store.writer("sim").begin(ep(0.0));
+        tx.object(
+            "lander",
+            "moon_fixed",
+            st(1.0),
+            ObjectMeta {
+                label: "LM".into(),
+                kind: ObjectKind::Spacecraft,
+                shape: Some(BodyShape::ellipsoid(MOON)),
+                path: Some(Path {
+                    points: vec![DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0)],
+                }),
+            },
+        );
+        tx.commit();
+
+        let snap = store.snapshot();
+        let lander = &snap.objects()[0];
+        assert_eq!(lander.label, "LM");
+        assert_eq!(lander.kind, ObjectKind::Spacecraft);
+        assert_eq!(lander.shape.unwrap().ellipsoid.name, "Moon");
+        assert_eq!(lander.path.as_ref().unwrap().points.len(), 2);
+        // An object committed without metadata gets the defaults.
+        let mut tx = store.writer("eph").begin(ep(0.0));
+        tx.object("moon", "root", st(0.0), m());
+        tx.commit();
+        let snap = store.snapshot();
+        let moon = snap
+            .objects()
+            .iter()
+            .find(|o| o.id.as_str() == "moon")
+            .unwrap();
+        assert_eq!(moon.kind, ObjectKind::Marker);
+        assert!(moon.label.is_empty() && moon.shape.is_none() && moon.path.is_none());
+    }
+
+    #[test]
     fn writer_is_send_and_concurrent_reads_stay_consistent() {
         let store = SceneStore::new();
         let mut tx = store.writer("sim").begin(ep(0.0));
-        tx.object("a", "f", st(0.0));
+        tx.object("a", "f", st(0.0), m());
         tx.commit();
 
         let writer = store.writer("sim"); // Send + Clone, moved to the producer thread
@@ -426,9 +542,9 @@ mod tests {
             let mut n = 0u64;
             while !stop_w.load(Ordering::Relaxed) {
                 let mut tx = writer.begin(ep(n as f64));
-                tx.object("a", "f", st(0.0));
+                tx.object("a", "f", st(0.0), m());
                 if n.is_multiple_of(2) {
-                    tx.object("b", "f", st(1.0));
+                    tx.object("b", "f", st(1.0), m());
                 }
                 tx.commit();
                 n += 1;

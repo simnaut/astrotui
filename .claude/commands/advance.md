@@ -24,10 +24,10 @@ GitHub — never assume memory from a prior run.
   PATCH (`gh pr edit` fails on this repo).
 - **Merge gate:** `main` is protected (squash-only, no direct pushes, enforced for
   admins) and requires three status checks green before merge — `test`, `firewall`, and
-  `claude-review`. `claude-review` is an **independent CI review** (the `Claude Code
-  Review` workflow) that runs automatically on every PR and posts findings as inline
-  review threads; those threads must be resolved before merge (required conversation
-  resolution). This loop does NOT self-review — it responds to the CI review (Phase A).
+  `claude-review` (an **independent CI review** that runs automatically on every PR).
+  Review findings — from the CI review and the repo's Copilot reviewer — are posted as
+  inline review threads that must be resolved before merge (required conversation
+  resolution). This loop does NOT self-review — it responds to those reviews (Phase A).
   Never bypass with `gh pr merge --admin`.
 
 ## Selection order ("earliest")
@@ -47,13 +47,14 @@ GitHub — never assume memory from a prior run.
      locally, commit (with the `Co-Authored-By` trailer) and push. If checks are only
      PENDING, leave the PR for a later cycle.
    - **Review (independent CI):** the `Claude Code Review` workflow reviews every PR
-     automatically and emits the required `claude-review` check, posting findings as
-     inline review threads. Do NOT self-review. Instead: wait for `claude-review` to
-     finish, then **address every finding it posted** — fix on the branch and push
-     (re-triggers CI + a fresh review), or, only if a comment is a genuine false
-     positive, reply explaining why. Resolve each thread via `resolveReviewThread`. The
-     review covers correctness, design fidelity to `docs/DESIGN.md`, the Bevy/ANISE
-     firewall, test adequacy, code quality, and scope — treat its comments as blocking.
+     automatically and emits the required `claude-review` check; the repo's Copilot
+     reviewer also runs. Do NOT self-review. Instead: wait for `claude-review` to finish,
+     then **address every inline finding posted on the PR** (from either reviewer) — fix
+     on the branch and push (re-triggers CI + a fresh review), or, only if a comment is a
+     genuine false positive, reply explaining why. Resolve each thread via
+     `resolveReviewThread`. Findings cover correctness, design fidelity to
+     `docs/DESIGN.md`, the Bevy/ANISE firewall, test adequacy, code quality, and scope —
+     treat them as blocking.
    - **Review threads:** ensure every unresolved thread (from the CI review or anywhere
      else, e.g. a human) is addressed on the branch and resolved via `resolveReviewThread`.
    - **Merge:** only when **all three required checks are green** (`test`, `firewall`,

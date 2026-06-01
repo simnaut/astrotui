@@ -5,6 +5,8 @@
 //! (§2, §12) this crate links **no Bevy** and **no ANISE/ephemeris** — it renders the
 //! states it is given. Implementation lands in P0 and later.
 
+pub mod scene;
+
 /// Test-only helpers (golden-frame snapshots). Available in this crate's tests and,
 /// for downstream crates, via the `testing` feature.
 #[cfg(any(test, feature = "testing"))]

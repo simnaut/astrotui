@@ -24,6 +24,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "astrodyn_frames"
 version = "0.2.0"
 source = "git+https://github.com/simnaut/astrodyn?rev=0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb#0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb"
@@ -71,9 +80,11 @@ dependencies = [
 name = "astrotui-core"
 version = "0.0.0"
 dependencies = [
+ "arc-swap",
  "astrodyn_frames",
  "astrodyn_planet",
  "astrodyn_quantities",
+ "glam",
  "insta",
  "ratatui",
 ]

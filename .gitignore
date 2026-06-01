@@ -1,1 +1,4 @@
 /target
+
+# DEM tile cache (astrotui-dem; exact path finalized in P2 / #41)
+/.dem-cache/

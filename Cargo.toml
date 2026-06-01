@@ -15,6 +15,13 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.94"
 repository = "https://github.com/simnaut/astrotui"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
 
 [workspace.dependencies]
 # Internal crates (path-wired; the §9 dependency graph).

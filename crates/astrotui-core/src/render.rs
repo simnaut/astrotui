@@ -5,10 +5,11 @@
 //! (issue #14):
 //!
 //! 1. builds an astrodyn [`FrameTree`] from a [`Snapshot`]'s frame records,
-//! 2. places each object as a transient child frame at its in-frame position,
-//! 3. reads `compute_relative_state(camera, object).trans.position` — the resolve-once
-//!    primitive of §4.4, letting astrodyn do all the frame math, and
-//! 4. orthographically projects that camera-frame position to a terminal cell.
+//! 2. resolves ONE transform per occupied frame via `compute_relative_state(camera, F)`
+//!    (§4.4 step 2), letting astrodyn do the frame math,
+//! 3. applies that transform to every object in the frame
+//!    (`pos_cam = origin + R_{F→cam} · p`), and
+//! 4. orthographically projects each camera-frame position to a terminal cell.
 //!
 //! Drawing those cells is the renderer's job (#15). Perspective + seamless log-zoom +
 //! angular-size LOD arrive in P1; frame *orientation* (rotating frames, `DQuat`→JEOD quat)
@@ -19,7 +20,7 @@
 use std::collections::HashMap;
 
 use astrodyn_frames::{FrameTree, RefFrameKind, RefFrameState, RefFrameTrans};
-use glam::DVec3;
+use glam::{DMat3, DVec3};
 use ratatui::layout::Rect;
 
 use crate::scene::{FrameId, ObjectId, Snapshot};
@@ -66,34 +67,34 @@ pub fn project_points(snap: &Snapshot, camera: &Camera, area: Rect) -> Vec<Proje
     if camera.scale <= 0.0 || area.width == 0 || area.height == 0 {
         return Vec::new();
     }
-    let Some((mut tree, ids)) = build_tree(snap) else {
+    let Some((tree, ids)) = build_tree(snap) else {
         return Vec::new();
     };
     let Some(&cam_id) = ids.get(&camera.frame) else {
         return Vec::new();
     };
 
-    // Add every object as a transient child frame at its in-frame position, so astrodyn
-    // composes the full chain to the camera frame for us (no hand-rolled frame math).
-    let mut object_frames = Vec::with_capacity(snap.objects().len());
+    // Resolve ONE transform per occupied frame and apply it to every object in that frame
+    // (DESIGN.md §4.4 step 2). `compute_relative_state(cam, F)` gives F's origin in camera
+    // coordinates and the camera→F rotation; transposing that rotation maps an object's
+    // in-frame position `p` into camera coordinates: pos_cam = origin + R_{F→cam} · p.
+    let mut by_frame: HashMap<usize, (DVec3, DMat3)> = HashMap::new();
+    let mut out = Vec::with_capacity(snap.objects().len());
     for obj in snap.objects() {
-        let Some(&parent) = ids.get(&obj.frame) else {
+        let Some(&frame_id) = ids.get(&obj.frame) else {
             continue;
         };
-        let aid = tree.add_child(
-            parent,
-            format!("__obj:{}", obj.id),
-            RefFrameKind::Body,
-            trans_state(obj.state.position, obj.state.velocity),
-        );
-        object_frames.push((obj.id.clone(), aid));
-    }
-
-    let mut out = Vec::with_capacity(object_frames.len());
-    for (id, aid) in object_frames {
-        let pos_cam = tree.compute_relative_state(cam_id, aid).trans.position;
+        let (origin, r_frame_to_cam) = *by_frame.entry(frame_id).or_insert_with(|| {
+            let s = tree.compute_relative_state(cam_id, frame_id);
+            (s.trans.position, s.rot.t_parent_this.transpose())
+        });
+        let pos_cam = origin + r_frame_to_cam * obj.state.position;
         if let Some(cell) = project_orthographic(pos_cam, camera.scale, area) {
-            out.push(ProjectedPoint { id, cell, pos_cam });
+            out.push(ProjectedPoint {
+                id: obj.id.clone(),
+                cell,
+                pos_cam,
+            });
         }
     }
     out
@@ -164,6 +165,11 @@ fn project_orthographic(pos_cam: DVec3, metres_per_cell: f64, area: Rect) -> Opt
     let col = cx + pos_cam.x / metres_per_cell;
     let row = cy - pos_cam.y / metres_per_cell; // camera +y is up; rows grow downward
 
+    // Cull non-finite coordinates first: a NaN/∞ in `pos_cam` would slip through the
+    // bounds check below (every comparison with NaN is false) and cast to a bogus cell.
+    if !col.is_finite() || !row.is_finite() {
+        return None;
+    }
     let left = f64::from(area.x);
     let top = f64::from(area.y);
     let right = f64::from(area.x) + f64::from(area.width);
@@ -171,7 +177,8 @@ fn project_orthographic(pos_cam: DVec3, metres_per_cell: f64, area: Rect) -> Opt
     if col < left || col >= right || row < top || row >= bottom {
         return None;
     }
-    // In-bounds, non-negative, < u16::MAX viewport extents → the truncation is exact.
+    // Floor into the containing cell: col/row are finite, in-bounds and non-negative here,
+    // so `as u16` truncates toward zero (== floor) and cannot saturate.
     Some((col as u16, row as u16))
 }
 
@@ -244,6 +251,53 @@ mod tests {
         let probe = pts.iter().find(|p| p.id.as_str() == "probe").unwrap();
         assert_eq!(probe.pos_cam.x, 5.0);
         assert_eq!(probe.cell, (25, 5));
+    }
+
+    #[test]
+    fn one_transform_per_frame_applies_to_all_its_objects() {
+        // Two objects share an offset child frame; each picks up that frame's transform.
+        let store = SceneStore::new();
+        let mut tx = store.writer("p").begin(Epoch::from_seconds(0.0));
+        tx.frame("root", None, BodyState::default())
+            .frame("ship", Some("root".into()), at(100.0, 0.0))
+            .object("nose", "ship", at(1.0, 0.0), ObjectMeta::default())
+            .object("tail", "ship", at(-1.0, 0.0), ObjectMeta::default());
+        tx.commit();
+        let snap = store.snapshot();
+
+        let pts = project_points(
+            &snap,
+            &Camera::overview("root", 1.0),
+            Rect::new(0, 0, 400, 10),
+        );
+        let nose = pts.iter().find(|p| p.id.as_str() == "nose").unwrap();
+        let tail = pts.iter().find(|p| p.id.as_str() == "tail").unwrap();
+        assert_eq!(nose.pos_cam.x, 101.0); // 100 (frame) + 1 (in-frame)
+        assert_eq!(tail.pos_cam.x, 99.0); // 100 (frame) - 1 (in-frame)
+    }
+
+    #[test]
+    fn non_finite_positions_are_culled() {
+        let snap = scene(&[
+            ("ok", at(0.0, 0.0)),
+            (
+                "nan",
+                BodyState {
+                    position: DVec3::new(f64::NAN, 0.0, 0.0),
+                    ..BodyState::default()
+                },
+            ),
+            (
+                "inf",
+                BodyState {
+                    position: DVec3::new(f64::INFINITY, 0.0, 0.0),
+                    ..BodyState::default()
+                },
+            ),
+        ]);
+        let pts = project_points(&snap, &Camera::overview("root", 1.0), area());
+        let ids: Vec<&str> = pts.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["ok"]); // NaN/∞ objects are dropped, not mapped to (0,0)
     }
 
     #[test]

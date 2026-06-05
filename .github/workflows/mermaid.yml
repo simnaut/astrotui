@@ -1,0 +1,38 @@
+name: Mermaid
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mermaid-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mermaid:
+    name: mermaid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Cache mermaid-cli + Chromium
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools/mermaid-lint/node_modules
+            ~/.cache/puppeteer
+          key: mermaid-${{ runner.os }}-${{ hashFiles('tools/mermaid-lint/package.json') }}
+      - name: Install mermaid-cli
+        run: npm --prefix tools/mermaid-lint install --no-audit --no-fund
+      - name: Lint mermaid blocks in tracked markdown
+        run: |
+          files=$(git ls-files '*.md')
+          echo "Linting markdown files:"
+          echo "$files"
+          node tools/mermaid-lint/lint.mjs $files

@@ -27,9 +27,10 @@ jobs:
           path: |
             tools/mermaid-lint/node_modules
             ~/.cache/puppeteer
-          key: mermaid-${{ runner.os }}-${{ hashFiles('tools/mermaid-lint/package.json') }}
-      - name: Install mermaid-cli
-        run: npm --prefix tools/mermaid-lint install --no-audit --no-fund
+          key: mermaid-${{ runner.os }}-${{ hashFiles('tools/mermaid-lint/package-lock.json') }}
+      - name: Install mermaid-cli (pinned via lockfile)
+        run: npm ci --no-audit --no-fund
+        working-directory: tools/mermaid-lint
       - name: Lint mermaid blocks in tracked markdown
         run: |
           files=$(git ls-files '*.md')

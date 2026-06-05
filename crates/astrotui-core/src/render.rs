@@ -21,9 +21,11 @@ use std::collections::HashMap;
 
 use astrodyn_frames::{FrameTree, RefFrameKind, RefFrameState, RefFrameTrans};
 use glam::{DMat3, DVec3};
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::widgets::StatefulWidget;
 
-use crate::scene::{FrameId, ObjectId, Snapshot};
+use crate::scene::{FrameId, ObjectId, SceneStore, Snapshot};
 
 /// The eye. In this skeleton it is a scene frame to sit in plus an orthographic scale; the
 /// full `Camera` (target, log-zoom, up, fov — DESIGN.md §4.4) lands with the camera presets
@@ -48,13 +50,17 @@ impl Camera {
     }
 }
 
-/// An object projected into the viewport.
+/// An object projected into the viewport, in **fractional** cell coordinates so a backend
+/// can rasterize at its own resolution (e.g. braille's 2×4 sub-cell dot grid). `(col, row)`
+/// are measured from the viewport's top-left in cells; `col` grows right, `row` grows down.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectedPoint {
     /// Which object.
     pub id: ObjectId,
-    /// Cell column/row in the viewport.
-    pub cell: (u16, u16),
+    /// Fractional cell column (grows right).
+    pub col: f64,
+    /// Fractional cell row (grows down).
+    pub row: f64,
     /// Position in the camera frame (metres) — retained for depth ordering / LOD later.
     pub pos_cam: DVec3,
 }
@@ -89,10 +95,11 @@ pub fn project_points(snap: &Snapshot, camera: &Camera, area: Rect) -> Vec<Proje
             (s.trans.position, s.rot.t_parent_this.transpose())
         });
         let pos_cam = origin + r_frame_to_cam * obj.state.position;
-        if let Some(cell) = project_orthographic(pos_cam, camera.scale, area) {
+        if let Some((col, row)) = project_orthographic(pos_cam, camera.scale, area) {
             out.push(ProjectedPoint {
                 id: obj.id.clone(),
-                cell,
+                col,
+                row,
                 pos_cam,
             });
         }
@@ -156,10 +163,11 @@ fn trans_state(position: DVec3, velocity: DVec3) -> RefFrameState {
 }
 
 /// Orthographic projection of a camera-frame position onto the viewport: the eye looks
-/// down −Z, screen +x is camera +x (right), screen +y is camera +y (up). `None` if the
-/// point falls outside `area`. Cell aspect (terminal cells ≈ 2:1) is refined with the
-/// backends in #15; here one cell spans `metres_per_cell` on both axes.
-fn project_orthographic(pos_cam: DVec3, metres_per_cell: f64, area: Rect) -> Option<(u16, u16)> {
+/// down −Z, screen +x is camera +x (right), screen +y is camera +y (up). Returns
+/// **fractional** cell coordinates (so a backend can rasterize at sub-cell resolution), or
+/// `None` if the point falls outside `area`. One cell spans `metres_per_cell` on both axes;
+/// cell aspect (terminal cells ≈ 2:1) is a backend concern.
+fn project_orthographic(pos_cam: DVec3, metres_per_cell: f64, area: Rect) -> Option<(f64, f64)> {
     let cx = f64::from(area.x) + f64::from(area.width) / 2.0;
     let cy = f64::from(area.y) + f64::from(area.height) / 2.0;
     let col = cx + pos_cam.x / metres_per_cell;
@@ -177,9 +185,45 @@ fn project_orthographic(pos_cam: DVec3, metres_per_cell: f64, area: Rect) -> Opt
     if col < left || col >= right || row < top || row >= bottom {
         return None;
     }
-    // Floor into the containing cell: col/row are finite, in-bounds and non-negative here,
-    // so `as u16` truncates toward zero (== floor) and cannot saturate.
-    Some((col as u16, row as u16))
+    Some((col, row))
+}
+
+/// A rendering backend: rasterizes projected points into a ratatui [`Buffer`]. Backends
+/// (braille / color-cell / graphics — DESIGN.md §5.1) live in their own crates and
+/// implement this trait, keeping `astrotui-core` backend-agnostic.
+pub trait Renderer {
+    /// Draw `points` (fractional cell coordinates within `area`, as produced by
+    /// [`project_points`]) into `buf`, rasterizing at the backend's own resolution.
+    fn draw_points(&self, points: &[(f64, f64)], area: Rect, buf: &mut Buffer);
+}
+
+/// The astrotui widget: projects a [`SceneStore`]'s latest snapshot through `camera` and
+/// rasterizes it with `renderer`. The renderer is injected so the host picks the backend
+/// (capability-based auto-detect arrives in P3); camera presets + log-zoom arrive in P1.
+pub struct SpaceView<'a> {
+    camera: &'a Camera,
+    renderer: &'a dyn Renderer,
+}
+
+impl<'a> SpaceView<'a> {
+    /// Build a view that renders `camera`'s perspective with `renderer`.
+    #[must_use]
+    pub fn new(camera: &'a Camera, renderer: &'a dyn Renderer) -> Self {
+        Self { camera, renderer }
+    }
+}
+
+impl StatefulWidget for SpaceView<'_> {
+    type State = SceneStore;
+
+    fn render(self, area: Rect, buf: &mut Buffer, state: &mut SceneStore) {
+        let snapshot = state.snapshot();
+        let points: Vec<(f64, f64)> = project_points(&snapshot, self.camera, area)
+            .into_iter()
+            .map(|p| (p.col, p.row))
+            .collect();
+        self.renderer.draw_points(&points, area, buf);
+    }
 }
 
 #[cfg(test)]
@@ -216,9 +260,9 @@ mod tests {
         let pts = project_points(&snap, &cam, area());
 
         let origin = pts.iter().find(|p| p.id.as_str() == "origin").unwrap();
-        assert_eq!(origin.cell, (10, 5)); // centre of the 20x10 area
+        assert_eq!((origin.col, origin.row), (10.0, 5.0)); // centre of the 20x10 area
         let right = pts.iter().find(|p| p.id.as_str() == "right").unwrap();
-        assert_eq!(right.cell, (12, 5)); // +4 m / 2 m-per-cell = +2 cells in +x
+        assert_eq!((right.col, right.row), (12.0, 5.0)); // +4 m / 2 m-per-cell = +2 cells in +x
     }
 
     #[test]
@@ -240,7 +284,7 @@ mod tests {
         );
         let probe = pts.iter().find(|p| p.id.as_str() == "probe").unwrap();
         assert_eq!(probe.pos_cam.x, 105.0);
-        assert_eq!(probe.cell, (200 + 105, 5));
+        assert_eq!((probe.col, probe.row), (305.0, 5.0)); // centre 200 + 105 m
 
         // From a camera riding "ship", the same probe is only 5 m in x.
         let pts = project_points(
@@ -250,7 +294,7 @@ mod tests {
         );
         let probe = pts.iter().find(|p| p.id.as_str() == "probe").unwrap();
         assert_eq!(probe.pos_cam.x, 5.0);
-        assert_eq!(probe.cell, (25, 5));
+        assert_eq!((probe.col, probe.row), (25.0, 5.0)); // centre 20 + 5 m
     }
 
     #[test]
@@ -315,5 +359,34 @@ mod tests {
         assert!(project_points(&snap, &Camera::overview("root", 0.0), area()).is_empty());
         let empty = SceneStore::new().snapshot();
         assert!(project_points(&empty, &Camera::overview("root", 1.0), area()).is_empty());
+    }
+
+    /// Records the points handed to a renderer, so we can check what `SpaceView` projected.
+    #[derive(Default)]
+    struct Recorder(std::cell::RefCell<Vec<(f64, f64)>>);
+    impl Renderer for Recorder {
+        fn draw_points(&self, points: &[(f64, f64)], _area: Rect, _buf: &mut Buffer) {
+            self.0.borrow_mut().extend_from_slice(points);
+        }
+    }
+
+    #[test]
+    fn space_view_projects_snapshot_to_the_renderer() {
+        let mut store = SceneStore::new();
+        let mut tx = store.writer("p").begin(Epoch::from_seconds(0.0));
+        tx.frame("root", None, BodyState::default())
+            .object("origin", "root", at(0.0, 0.0), ObjectMeta::default())
+            .object("right", "root", at(4.0, 0.0), ObjectMeta::default());
+        tx.commit();
+
+        let cam = Camera::overview("root", 2.0);
+        let recorder = Recorder::default();
+        let a = area();
+        let mut buf = Buffer::empty(a);
+        SpaceView::new(&cam, &recorder).render(a, &mut buf, &mut store);
+
+        let mut got = recorder.0.into_inner();
+        got.sort_by(|x, y| x.0.total_cmp(&y.0));
+        assert_eq!(got, vec![(10.0, 5.0), (12.0, 5.0)]); // same projection as project_points
     }
 }

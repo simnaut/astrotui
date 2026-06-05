@@ -103,12 +103,43 @@ back in the **camera's own coordinates**. Therefore:
   lander", "watch from the orbit-relative frame") maps 1:1 onto astrodyn's
   *existing* frame markers.
 
-> **Dynamic, not typed, on the hot path.** Cameras switch and objects live on
-> frame nodes chosen at *runtime* (`FrameId`), and the open set of frame types
-> (`define_planet!`/`define_vehicle!`) cannot be enumerated in a `match`. So the
-> render loop uses the dynamic `compute_relative_state(from_id, to_id)`. The
-> typed `compute_relative_state_typed::<From, To>()` is used only at fixed call
-> sites where both frames are known at compile time.
+> **Closed `FrameKind` by default; dynamic only for the open tail** *(revised
+> 2026-06-04 — supersedes the earlier "dynamic, not typed on the hot path"
+> stance).* Core classifies every frame into a **closed enum** with a string
+> escape hatch:
+>
+> ```rust
+> enum FrameKind {
+>     RootInertial,
+>     PlanetInertial(PlanetId),
+>     PlanetFixed(PlanetId),
+>     Topocentric(SiteId),
+>     BodyFrame(VehicleId),
+>     // … the frames core actually supports …
+>     Other(String),               // the genuine producer-invented tail
+> }
+> ```
+>
+> The common, dangerous frames — especially the *oriented* ones — are therefore
+> type-checked **by category** in core; only genuinely producer-invented frames
+> land in `Other(String)` and stay stringly-resolved. This recovers the
+> compile-time net where orientation bugs actually live, while staying
+> source-agnostic at the edges. (The firewall does **not** force erasure —
+> `astrodyn_quantities::frame`'s markers are pure and already a core dep; only the
+> *open tail* does, so a scalpel beats the sledgehammer.)
+>
+> Two boundaries to keep straight:
+> - **Category, not identity.** `PlanetFixed(PlanetId)` distinguishes a body-fixed
+>   frame from a topocentric one *by category*; *which* planet stays a runtime
+>   `PlanetId`, because astrodyn's `PlanetFixed<P>` is compile-time-generic and core
+>   can't know the planet for an arbitrary producer. The fully-typed markers
+>   (`PlanetFixed<Moon>`) are used only at **fixed compile-time sites** — a
+>   hardcoded camera preset, the orientation proof test (§4.4).
+> - **Render still resolves by node.** Geometry is still evaluated via
+>   `compute_relative_state(from, to)` over a `FrameTree` rebuilt per render;
+>   `FrameKind` governs *classification, the typed bridge, and diagnostics*, not the
+>   per-vertex math. `compute_relative_state_typed::<From, To>()` is used at the
+>   fixed-site cases.
 
 Camera presets — each is just a `FrameId` the camera sits in:
 
@@ -246,6 +277,17 @@ flowchart LR
   U --> R["SpaceView render"]
 ```
 
+> **In-process `Producer` first; wire/streaming deferred** *(revised 2026-06-04).*
+> The seam producers actually plug into is an in-process trait —
+> `trait Producer { fn populate(&self, w: &mut SceneWriter); }` — and the
+> orchestrator demo's body placement is its first impl. The self-describing **wire
+> codec and the multi-process streaming/reader machinery (§4.3) are deferred**
+> until a real second producer exists to pin their shape; building them now would
+> freeze the most consequential contract against P3 guesses. `SceneWriter` /
+> layers / snapshot are the durable seam; the transport is built when needed. (The
+> multi-process picture in §4's diagram remains the *eventual* P3 architecture —
+> this defers *when* it's built, not *whether*.)
+
 ### 4.2 The scene data model
 
 astrotui-core **owns** the canonical render model (the `SceneStore`); producers
@@ -262,7 +304,7 @@ producer is slow or bursty.
 pub struct SceneObject {
     pub id:    ObjectId,
     pub label: Cow<'static, str>,        // shown in the camera/frame switcher UI
-    pub frame: FrameId,                  // node in the FrameTree this object lives in
+    pub frame: FrameKind,                // classified frame: closed enum + Other(String) tail (§3)
     pub kind:  ObjectKind,               // Body | Spacecraft | Site | Marker
     pub shape: Option<BodyShape>,        // astrodyn_planet::PlanetShape (+ optional DEM handle)
     pub trail: TrailRef,                 // plugin-PROVIDED ring buffer, PRODUCER-populated
@@ -272,7 +314,9 @@ pub struct SceneObject {
 
 Frames and objects carry **stable ids + human labels + kind**, so the host's
 camera UI can enumerate `scene.frames()` / `scene.objects()` and let the user
-target any of them (the in-TUI frame/camera switcher, §10/P4).
+target any of them (the in-TUI frame/camera switcher, §10/P4). A producer-declared
+frame is **classified into `FrameKind`** (§3) at ingest — recognized frames get
+their typed category, the rest fall back to `Other(String)`.
 
 **Concurrency.** A producer commits on its own thread into a back buffer; the
 swap is atomic; the widget reads the latest snapshot lock-free. Trails are
@@ -280,6 +324,14 @@ append-only ring buffers; a snapshot pins the current write index so the render
 sees a consistent prefix without copying the buffer.
 
 ### 4.3 The wire format — one self-describing stream
+
+> **Status: specified, not yet built** *(revised 2026-06-04).* The shape below is
+> the frozen paper spec; the codec and readers are **deferred** behind the
+> in-process `Producer` trait (§4.1) until producer #2 pins their real shape. When
+> built, a wire frame's `kind` string is **classified into `FrameKind`** (§3) on
+> ingest — recognized → typed category, unrecognized → `Other(String)`. That
+> classify step *is* the type-erasure boundary, and the point the §4.4 proof test
+> exercises (with byte-encoding stubbed).
 
 The serialized form is what crosses the socket from a spawned sim, arrives from
 real ops, *and* sits in a replay file — **one codec** (`astrotui-wire`), so all
@@ -342,6 +394,22 @@ Per frame, over the latest snapshot's `FrameTree`:
 4. **Project** `pos_cam` through view + log-depth.
 5. **LOD** on angular size → point | shaded ellipsoid | DEM mesh.
 6. **Rasterize** into the active backend's cell buffer → ratatui `Buffer`.
+
+> **Unresolved frames are loud** *(revised 2026-06-04).* An object whose frame
+> does not resolve in the snapshot's `FrameTree` is **surfaced** — a logged warning
+> plus a visible orphan marker / status line — never silently culled. A mistyped or
+> dangling frame id must not present as a blank screen. (This replaces the P0
+> skeleton's silent `else continue`.)
+>
+> **Orientation correctness is proven before P2.** Core stores attitude as a raw
+> `DQuat` carrying no from/to frame, so frame-mixing in rotation composition is the
+> highest-risk gap — and exactly where a string-only model gives no net. Before the
+> P2 rotating-frame work, one end-to-end test drives a typed
+> `FrameTransform<RootInertial, PlanetFixed<Moon>>` through the `Producer`/`FrameKind`
+> classify boundary (wire byte-encoding stubbed) into core's untyped rebuild, then
+> asserts both `att_cam` and `pos_cam` against a hand-computed reference. That test
+> **gates the P2 epic** and validates the "structural enforcement suffices" thesis
+> before anything is built on it.
 
 ```mermaid
 flowchart LR
@@ -545,8 +613,9 @@ flowchart TD
 | Phase | Deliverable |
 |---|---|
 | **P0** | `SceneStore` + scoped `SceneWriter` + snapshot/double-buffer; braille backend; `RootInertial` overview; a trivial in-process producer feeding Earth/Moon/Sun points. *Validates camera=frame + projection + ingestion.* |
-| **P1** | Camera presets + seamless log-zoom + LOD (point → shaded ellipsoid); color-cell backend; `astrotui-wire` codec + replay reader. |
-| **P2** | Moon-landing slice: producer-supplied `MoonMeDe421` frame, `Topocentric<Moon>` camera, trail + path. **DEM via a dedicated design doc + staged build:** (1) one static pre-tiled site → mesh → shade end-to-end, (2) dynamic tiling/paging, (3) LOD + memory budget, (4) hillshade across all backends. |
+| **P1** | Camera presets + seamless log-zoom + LOD (point → shaded ellipsoid); color-cell backend. *(Wire codec + replay reader **deferred** behind the in-process `Producer` trait — §4.1.)* |
+| **Pre-P2 hardening** *(added 2026-06-04)* | Migrate core to the `FrameKind` enum + `Other(String)` tail (§3); introduce the in-process `Producer` trait (§4.1); make unresolved frames loud (§4.4); and the **end-to-end rotating-frame orientation proof test that gates P2** (§4.4). |
+| **P2** | Moon-landing slice: producer-supplied `MoonMeDe421` frame, `Topocentric<Moon>` camera, trail + path. **Blocked by the Pre-P2 orientation proof test (§4.4).** **DEM via a dedicated design doc + staged build:** (1) one static pre-tiled site → mesh → shade end-to-end, (2) dynamic tiling/paging, (3) LOD + memory budget, (4) hillshade across all backends. |
 | **P3** | Separate-process sim + exporter; orchestrator spawn/observe lifecycle; telemetry listen + ephemeris body-filler layer; backend auto-detect. |
 | **P4** | Earth→Jupiter cruise scene, HUD, in-TUI frame/camera switcher driven by `scene.frames()`. |
 
@@ -571,9 +640,10 @@ flowchart TD
 ## 12. Key decisions (summary)
 
 1. **Camera = reference frame**; switching cameras = `compute_relative_state`
-   against a different `FrameId`. Dynamic by `FrameId` on the hot path (typed API
-   only at fixed sites); transform resolved once per occupied frame, applied by
-   matrix to all geometry.
+   against a different frame. Frames are a **closed `FrameKind` enum +
+   `Other(String)` tail** (§3, revised 2026-06-04) — category-typed in core,
+   dynamic only for the open tail, with typed astrodyn markers at fixed sites.
+   Transform resolved once per occupied frame, applied by matrix to all geometry.
 2. **astrotui is a host-agnostic plugin**; the primary host is a long-lived
    orchestrator whose **viz lifecycle is independent of the sim's**.
 3. **Sims run as separate processes** streaming a wire format; **telemetry is the

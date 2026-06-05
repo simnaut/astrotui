@@ -933,6 +933,8 @@ dependencies = [
  "astrotui-render-color",
  "astrotui-render-graphics",
  "astrotui-wire",
+ "glam",
+ "ratatui",
 ]
 
 [[package]]

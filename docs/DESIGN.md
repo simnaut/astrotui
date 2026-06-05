@@ -139,7 +139,10 @@ back in the **camera's own coordinates**. Therefore:
 >   `compute_relative_state(from, to)` over a `FrameTree` rebuilt per render;
 >   `FrameKind` governs *classification, the typed bridge, and diagnostics*, not the
 >   per-vertex math. `compute_relative_state_typed::<From, To>()` is used at the
->   fixed-site cases.
+>   fixed-site cases. Objects and the camera still name their frame by its
+>   **`FrameId` handle**; `FrameKind` is a property *of that node* (it sits on the
+>   `FrameRecord`, §4.2), never a substitute for the handle that resolution and
+>   dangling-detection need.
 
 Camera presets — each is just a `FrameId` the camera sits in:
 
@@ -304,7 +307,7 @@ producer is slow or bursty.
 pub struct SceneObject {
     pub id:    ObjectId,
     pub label: Cow<'static, str>,        // shown in the camera/frame switcher UI
-    pub frame: FrameKind,                // classified frame: closed enum + Other(String) tail (§3)
+    pub frame: FrameId,                  // handle to the FrameTree node this object lives in
     pub kind:  ObjectKind,               // Body | Spacecraft | Site | Marker
     pub shape: Option<BodyShape>,        // astrodyn_planet::PlanetShape (+ optional DEM handle)
     pub trail: TrailRef,                 // plugin-PROVIDED ring buffer, PRODUCER-populated
@@ -314,9 +317,26 @@ pub struct SceneObject {
 
 Frames and objects carry **stable ids + human labels + kind**, so the host's
 camera UI can enumerate `scene.frames()` / `scene.objects()` and let the user
-target any of them (the in-TUI frame/camera switcher, §10/P4). A producer-declared
-frame is **classified into `FrameKind`** (§3) at ingest — recognized frames get
-their typed category, the rest fall back to `Other(String)`.
+target any of them (the in-TUI frame/camera switcher, §10/P4).
+
+**`FrameKind` lives on the frame node, not the object reference.** An object (and
+the camera) names its frame by its `FrameId` **handle** — that handle is what
+`compute_relative_state` resolves against and what the §4.4 "unresolved frame"
+check tests for. Each `FrameTree` node *also* carries a `FrameKind` classification,
+assigned at ingest from the producer-declared kind (recognized → typed category;
+otherwise `Other(declared_kind)`). So the two are orthogonal and both present:
+`FrameId` = node identity (resolution, dangling-detection); `FrameKind` = that
+node's classification (the typed bridge and diagnostics of §3) — never a
+replacement for the handle.
+
+```rust
+pub struct FrameRecord {
+    pub id:     FrameId,            // stable node handle (what objects + camera point at)
+    pub parent: Option<FrameId>,   // None == root
+    pub kind:   FrameKind,          // classification (§3); Other(String) for the open tail
+    pub state:  BodyState,          // state relative to parent
+}
+```
 
 **Concurrency.** A producer commits on its own thread into a back buffer; the
 swap is atomic; the widget reads the latest snapshot lock-free. Trails are

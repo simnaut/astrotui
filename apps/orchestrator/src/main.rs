@@ -279,7 +279,7 @@ mod tests {
 
         let cluster_span = |keep: &dyn Fn(u16) -> bool| -> u16 {
             let cols: Vec<u16> = lit.iter().copied().filter(|&x| keep(x)).collect();
-            assert!(!cols.is_empty(), "expected a body in this third");
+            assert!(!cols.is_empty(), "expected a body in this region");
             cols.last().unwrap() - cols.first().unwrap() + 1
         };
         let sun = cluster_span(&|x| x < area.width / 4);

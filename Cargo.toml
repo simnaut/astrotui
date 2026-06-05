@@ -39,4 +39,6 @@ astrodyn_frames = { git = "https://github.com/simnaut/astrodyn", rev = "0f78ef96
 astrodyn_quantities = { git = "https://github.com/simnaut/astrodyn", rev = "0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb" }
 astrodyn_planet = { git = "https://github.com/simnaut/astrodyn", rev = "0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb" }
 
-# ratatui lives in astrotui-core's own manifest (added via `cargo add`).
+# ratatui — shared across core + the render backends so the Buffer type in the
+# Renderer trait is the same everywhere.
+ratatui = "0.30"

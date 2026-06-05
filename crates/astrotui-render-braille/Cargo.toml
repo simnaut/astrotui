@@ -9,6 +9,7 @@ description = "Monochrome braille-dot rendering backend for astrotui (the capabi
 
 [dependencies]
 astrotui-core = { workspace = true }
+ratatui = { workspace = true }
 
 [lints]
 workspace = true

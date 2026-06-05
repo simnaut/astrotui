@@ -8,7 +8,7 @@ license.workspace = true
 description = "Source-agnostic rendering core for astrotui: widget, Camera, SceneStore/SceneWriter, Renderer trait, projection/LOD. Links no Bevy and no ANISE/ephemeris."
 
 [dependencies]
-ratatui = "0.30.0"
+ratatui = { workspace = true }
 astrodyn_frames = { workspace = true }
 astrodyn_quantities = { workspace = true }
 astrodyn_planet = { workspace = true }

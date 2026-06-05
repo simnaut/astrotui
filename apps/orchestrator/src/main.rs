@@ -3,15 +3,16 @@
 //! Demo (#16, extended): a trivial in-process producer places the Sun, Earth, and Moon on
 //! a `RootInertial` frame at their **real radii and real mutual distances** (Earth–Moon
 //! 384 400 km, Earth–Sun 1 AU), and the app views them through a **perspective camera**
-//! 1 000 000 km from Earth. Nothing here is size-stylized: the camera distance plus its
-//! field of view is what makes Earth span ~25% of the width — the apparent size falls out
-//! of where the camera sits, not a hand-picked fraction.
+//! 350 000 km from Earth. Nothing here is size-stylized: the camera distance plus its field
+//! of view is what makes Earth span ~40% of the width — the apparent size falls out of where
+//! the camera sits, not a hand-picked fraction.
 //!
-//! The only thing arranged is where the camera points: the Sun (1 AU behind Earth) and the
-//! Moon (in front of it) are nudged a fraction of a degree off the view axis so all three
-//! read as distinct discs. The honest, counter-intuitive payoff of true scale: the Sun,
-//! 109× Earth's radius, renders *smaller* than the nearby Earth (~18% vs 25% of the width)
-//! because it is ~370× farther away; the Moon, nearer than Earth, is smaller still (~11%).
+//! The only thing arranged is where the camera points: Earth is the nearest body, with the
+//! Sun (1 AU beyond it) and the Moon (384 400 km beyond it) both on the far side, nudged a
+//! couple of degrees off the view axis so all three read as distinct discs. The honest,
+//! counter-intuitive payoff of true scale: the Sun, 109× Earth's radius, renders *far*
+//! smaller than the nearby Earth (~10% vs 40% of the width) because it is ~430× farther
+//! away; the Moon, beyond Earth and tiny, is smaller still (~5%).
 //!
 //! Core's projection is orthographic (DESIGN.md §4.4 skeleton); the small perspective
 //! projector here previews P1's perspective + seamless log-zoom (#18) and the angular-size
@@ -32,24 +33,26 @@ use ratatui::layout::Rect;
 
 /// Terminal cells are roughly twice as tall as wide; correct for it so discs look round.
 const CELL_ASPECT: f64 = 2.0;
-/// How far the camera sits from Earth (m): 1 000 000 km — a real deep-space vantage, about
-/// 2.6× the Moon's orbital radius.
-const CAM_DISTANCE_M: f64 = 1.0e9;
+/// How far the camera sits from Earth (m): 350 000 km — a close vantage, just inside the
+/// Moon's orbital radius, so Earth (the nearest body) looms large and the far-off Sun is
+/// small.
+const CAM_DISTANCE_M: f64 = 3.5e8;
 /// Earth's apparent diameter as a fraction of the viewport width (> 0.2, per the brief). The
 /// camera's field of view is derived from this and [`CAM_DISTANCE_M`] — Earth is *framed*,
 /// not resized.
-const EARTH_SCREEN_FRACTION: f64 = 0.25;
+const EARTH_SCREEN_FRACTION: f64 = 0.40;
 
 /// Mean Earth–Sun distance (m): 1 astronomical unit.
 const EARTH_SUN_M: f64 = 1.495_978_707e11;
 /// Mean Earth–Moon distance (m).
 const EARTH_MOON_M: f64 = 3.844e8;
 
-/// Framing tilt of the Sun off the camera→Earth axis (rad, ≈ −0.91°), toward screen-left.
-/// A fraction of a degree — the Sun stays a true 1 AU away, just not dead behind Earth.
-const SUN_FRAMING_RAD: f64 = -0.015_92;
-/// Framing tilt of the Moon off the axis (rad, ≈ +1.40°), toward screen-right.
-const MOON_FRAMING_RAD: f64 = 0.024_51;
+/// Framing tilt of the Sun off the camera→Earth axis (rad, ≈ −1.83°), toward screen-left.
+/// A couple of degrees — the Sun stays a true 1 AU away, just not dead behind Earth.
+const SUN_FRAMING_RAD: f64 = -0.031_97;
+/// Framing tilt of the Moon off the axis (rad, ≈ +3.49°), toward screen-right. Larger than
+/// the Sun's because the Moon is so much closer, it needs more angle to clear Earth's disc.
+const MOON_FRAMING_RAD: f64 = 0.060_97;
 
 /// `tan(fov_x / 2)`: the half-width field of view that frames Earth at
 /// [`EARTH_SCREEN_FRACTION`] from [`CAM_DISTANCE_M`]. Earth's on-screen diameter fraction is
@@ -59,9 +62,9 @@ fn fov_half_tan() -> f64 {
 }
 
 /// Build the Sun–Earth–Moon scene on the root inertial frame at **real radii and real
-/// distances**. Earth sits at the origin; the Sun is a true 1 AU behind it and the Moon a
-/// true 384 400 km in front, each tilted a fraction of a degree off the view axis so the
-/// camera frames three separate discs.
+/// distances**. Earth sits at the origin (nearest the camera); the Sun is a true 1 AU beyond
+/// it and the Moon a true 384 400 km beyond it, both on the far side and tilted a couple of
+/// degrees off the view axis so the camera frames three separate discs with Earth dominant.
 fn build_scene() -> SceneStore {
     let store = SceneStore::new();
     let mut tx = store.writer("demo").begin(Epoch::from_seconds(0.0));
@@ -70,15 +73,15 @@ fn build_scene() -> SceneStore {
         .object(
             "sun",
             "root",
-            // 1 AU behind Earth (+z, away from the camera), tilted toward screen-left.
+            // 1 AU beyond Earth (+z, away from the camera), tilted toward screen-left.
             point(axis_offset(EARTH_SUN_M, SUN_FRAMING_RAD, false)),
             body("Sun", SUN),
         )
         .object(
             "moon",
             "root",
-            // 384 400 km in front of Earth (−z, toward the camera), tilted screen-right.
-            point(axis_offset(EARTH_MOON_M, MOON_FRAMING_RAD, true)),
+            // 384 400 km beyond Earth (+z, far side), tilted toward screen-right.
+            point(axis_offset(EARTH_MOON_M, MOON_FRAMING_RAD, false)),
             body("Moon", MOON),
         );
     tx.commit();
@@ -231,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn earth_disc_spans_more_than_a_fifth_of_the_width() {
+    fn earth_disc_dominates_the_view() {
         let store = build_scene();
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
@@ -241,22 +244,23 @@ mod tests {
         let mid = area.height / 2;
         let lit = lit_columns(&buf, area, mid);
         assert!(!lit.is_empty(), "nothing drawn on the centre row");
-        // Earth is the cluster in the central third — the Sun (left third) and Moon (right
-        // third) sit outside this window, so we measure Earth alone.
+        // Earth is the cluster in the central half — the Sun (far left) and Moon (far right)
+        // sit outside this window, so we measure Earth alone.
         let centre = area.width / 2;
         let near: Vec<u16> = lit
             .iter()
             .copied()
-            .filter(|&x| x.abs_diff(centre) < area.width / 6)
+            .filter(|&x| x.abs_diff(centre) < area.width / 4)
             .collect();
         assert!(
             !near.is_empty(),
             "Earth disc not found near the centre column"
         );
         let span = near.last().unwrap() - near.first().unwrap() + 1;
+        // Earth is framed at 40% of the width; require well over the 20% brief to lock that in.
         assert!(
-            f64::from(span) >= 0.2 * f64::from(area.width),
-            "Earth disc spans {span} cells of {}, want ≥ 20%",
+            f64::from(span) >= 0.3 * f64::from(area.width),
+            "Earth disc spans {span} cells of {}, want ≥ 30%",
             area.width
         );
     }
@@ -275,11 +279,11 @@ mod tests {
 
         let cluster_span = |keep: &dyn Fn(u16) -> bool| -> u16 {
             let cols: Vec<u16> = lit.iter().copied().filter(|&x| keep(x)).collect();
-            assert!(!cols.is_empty(), "expected a body in this third");
+            assert!(!cols.is_empty(), "expected a body in this region");
             cols.last().unwrap() - cols.first().unwrap() + 1
         };
-        let sun = cluster_span(&|x| x < area.width / 3);
-        let earth = cluster_span(&|x| x.abs_diff(centre) < area.width / 6);
+        let sun = cluster_span(&|x| x < area.width / 4);
+        let earth = cluster_span(&|x| x.abs_diff(centre) < area.width / 4);
         assert!(
             sun < earth,
             "Sun spans {sun} cells but Earth only {earth}; the distant Sun should look smaller"
@@ -294,14 +298,14 @@ mod tests {
         render_scene(&store, area, &mut buf);
         let mid = area.height / 2;
         let lit = lit_columns(&buf, area, mid);
-        // Sun limb sits left of Earth, Moon sits right of it — so the lit span on the centre
-        // row reaches both the left and right thirds of the viewport.
+        // Sun sits left of Earth, Moon right of it — and Earth (40% wide) stays inside the
+        // central half, so the outer quarters can only be lit by the Sun and the Moon.
         assert!(
-            lit.iter().any(|&x| x < area.width / 3),
+            lit.iter().any(|&x| x < area.width / 4),
             "Sun not visible on the left"
         );
         assert!(
-            lit.iter().any(|&x| x > 2 * area.width / 3),
+            lit.iter().any(|&x| x > 3 * area.width / 4),
             "Moon not visible on the right"
         );
     }

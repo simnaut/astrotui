@@ -1,0 +1,14 @@
+{
+  "name": "astrotui-mermaid-lint",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Validate the mermaid diagrams in astrotui docs by rendering them with mmdc.",
+  "type": "module",
+  "scripts": {
+    "lint": "node lint.mjs",
+    "lint:design": "node lint.mjs ../../docs/DESIGN.md"
+  },
+  "dependencies": {
+    "@mermaid-js/mermaid-cli": "^11.15.0"
+  }
+}

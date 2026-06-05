@@ -30,8 +30,10 @@ impl Renderer for BrailleRenderer {
         // One accumulator byte per terminal cell, OR-ing in a bit per lit 2×4 sub-cell dot.
         let mut dots = vec![0u8; w * h];
         for &(col, row) in points {
-            let dx = (col - f64::from(area.x)) * 2.0;
-            let dy = (row - f64::from(area.y)) * 4.0;
+            // Points are local to `area` ((0, 0) = top-left); the area offset is added when
+            // writing cells below.
+            let dx = col * 2.0;
+            let dy = row * 4.0;
             if !dx.is_finite() || !dy.is_finite() || dx < 0.0 || dy < 0.0 {
                 continue;
             }
@@ -122,5 +124,15 @@ mod tests {
             Rect::new(0, 0, 0, 0),
             &mut Buffer::empty(a),
         );
+    }
+
+    #[test]
+    fn renders_into_an_offset_area() {
+        // Local (0,0) maps to the area's top-left cell (2,1): the area offset is applied
+        // when writing, not only for (0,0)-origin areas.
+        let a = Rect::new(2, 1, 3, 2);
+        let buf = render(&[(0.0, 0.0)], a);
+        assert_eq!(glyph(&buf, 2, 1), "\u{2801}");
+        assert_eq!(glyph(&buf, 4, 2), " "); // another in-area cell, untouched
     }
 }

@@ -85,8 +85,9 @@ fn build_scene() -> SceneStore {
     store
 }
 
-/// A world position `distance` m from the origin, tilted `az` rad off the camera→Earth (+z)
-/// axis in the x–z plane. `toward_camera` puts it on the −z (near) side; otherwise +z (far).
+/// A world position `distance` m from the origin, tilted `az` rad in the x–z plane off the
+/// view axis (the root z-axis through the camera and Earth). `toward_camera` places it on the
+/// −z (near) side of Earth; otherwise the +z (far) side.
 fn axis_offset(distance: f64, az: f64, toward_camera: bool) -> DVec3 {
     let z = distance * az.cos();
     DVec3::new(distance * az.sin(), 0.0, if toward_camera { -z } else { z })
@@ -109,8 +110,8 @@ fn body(label: &'static str, shape: PlanetShape) -> ObjectMeta {
 }
 
 /// Draw the scene into `buf` through the perspective camera. The camera sits at
-/// `−CAM_DISTANCE` on the root z-axis looking toward +z, so a world point's camera-frame
-/// position is just `position + (0, 0, CAM_DISTANCE)`. A body's on-screen radius is its true
+/// `−CAM_DISTANCE_M` on the root z-axis looking toward +z, so a world point's camera-frame
+/// position is just `position + (0, 0, CAM_DISTANCE_M)`. A body's on-screen radius is its true
 /// `r_eq` divided by the world width spanned by half the screen at that depth — so nearer
 /// bodies loom larger and the distant Sun shrinks. Off-screen dots are culled per-dot by the
 /// renderer.

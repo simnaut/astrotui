@@ -152,9 +152,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal, store: &SceneStore) -> io::Resul
 mod tests {
     use super::*;
 
-    fn drawn_columns(buf: &Buffer, area: Rect, row: u16) -> Vec<u16> {
-        (area.x..area.x + area.width)
-            .filter(|&x| buf[(x, row)].symbol() != " ")
+    // Lit columns on `area`'s LOCAL row `row`, returned as columns local to the area
+    // (`0..width`). Buffer indexing is offset by `area.x`/`area.y`, so it's correct for any
+    // area origin and the callers' comparisons against `area.width` stay in one space.
+    fn lit_columns(buf: &Buffer, area: Rect, row: u16) -> Vec<u16> {
+        (0..area.width)
+            .filter(|&c| buf[(area.x + c, area.y + row)].symbol() != " ")
             .collect()
     }
 
@@ -176,7 +179,7 @@ mod tests {
 
         // On the centre row, Earth's filled disc straddles the middle; measure its width.
         let mid = area.height / 2;
-        let lit = drawn_columns(&buf, area, mid);
+        let lit = lit_columns(&buf, area, mid);
         assert!(!lit.is_empty(), "nothing drawn on the centre row");
         // Earth is the cluster around the centre column.
         let centre = area.width / 2;
@@ -185,6 +188,10 @@ mod tests {
             .copied()
             .filter(|&x| x.abs_diff(centre) < area.width / 4)
             .collect();
+        assert!(
+            !near.is_empty(),
+            "Earth disc not found near the centre column"
+        );
         let span = near.last().unwrap() - near.first().unwrap() + 1;
         assert!(
             f64::from(span) >= 0.2 * f64::from(area.width),
@@ -200,7 +207,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         render_scene(&store, area, &mut buf);
         let mid = area.height / 2;
-        let lit = drawn_columns(&buf, area, mid);
+        let lit = lit_columns(&buf, area, mid);
         // Sun limb sits left of Earth, Moon sits right of it — so the lit span on the centre
         // row reaches both the left and right thirds of the viewport.
         assert!(

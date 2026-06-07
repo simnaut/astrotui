@@ -24,8 +24,11 @@ use std::time::Duration;
 
 use astrodyn_planet::{PlanetShape, EARTH, MOON, SUN};
 use astrodyn_quantities::{FrameUid, RootInertial};
+use astrotui_core::producer::Producer;
 use astrotui_core::render::Renderer;
-use astrotui_core::scene::{BodyShape, BodyState, Epoch, ObjectKind, ObjectMeta, SceneStore};
+use astrotui_core::scene::{
+    BodyShape, BodyState, Epoch, ObjectKind, ObjectMeta, SceneStore, SceneWriter,
+};
 use astrotui_render_braille::BrailleRenderer;
 use glam::DVec3;
 use ratatui::buffer::Buffer;
@@ -62,36 +65,48 @@ fn fov_half_tan() -> f64 {
     EARTH.r_eq() / (CAM_DISTANCE_M * EARTH_SCREEN_FRACTION)
 }
 
-/// Build the Sun–Earth–Moon scene on the root inertial frame at **real radii and real
-/// distances**. Earth sits at the origin (nearest the camera); the Sun is a true 1 AU beyond
-/// it and the Moon a true 384 400 km beyond it, both on the far side and tilted a couple of
-/// degrees off the view axis so the camera frames three separate discs with Earth dominant.
+/// The in-process [`Producer`] for the demo scene — the first `Producer` impl (DESIGN §4.1).
+///
+/// Places the Sun–Earth–Moon on the root inertial frame at **real radii and real distances**.
+/// Earth sits at the origin (nearest the camera); the Sun is a true 1 AU beyond it and the
+/// Moon a true 384 400 km beyond it, both on the far side and tilted a couple of degrees off
+/// the view axis so the camera frames three separate discs with Earth dominant. The bodies are
+/// scene *objects* (the demo exercises the producer seam, not the frame-document consumer).
+struct DemoProducer;
+
+impl Producer for DemoProducer {
+    fn populate(&self, w: &mut SceneWriter) {
+        let root = FrameUid::of::<RootInertial>();
+        let mut tx = w.begin(Epoch::from_seconds(0.0));
+        tx.frame(root.clone(), None, BodyState::default());
+        tx.object(
+            "earth",
+            root.clone(),
+            point(DVec3::ZERO),
+            body("Earth", EARTH),
+        )
+        .object(
+            "sun",
+            root.clone(),
+            // 1 AU beyond Earth (+z, away from the camera), tilted toward screen-left.
+            point(axis_offset(EARTH_SUN_M, SUN_FRAMING_RAD, false)),
+            body("Sun", SUN),
+        )
+        .object(
+            "moon",
+            root,
+            // 384 400 km beyond Earth (+z, far side), tilted toward screen-right.
+            point(axis_offset(EARTH_MOON_M, MOON_FRAMING_RAD, false)),
+            body("Moon", MOON),
+        );
+        tx.commit();
+    }
+}
+
+/// Build the demo scene by running [`DemoProducer`] into a fresh store.
 fn build_scene() -> SceneStore {
     let store = SceneStore::new();
-    let root = FrameUid::of::<RootInertial>();
-    let mut tx = store.writer("demo").begin(Epoch::from_seconds(0.0));
-    tx.frame(root.clone(), None, BodyState::default());
-    tx.object(
-        "earth",
-        root.clone(),
-        point(DVec3::ZERO),
-        body("Earth", EARTH),
-    )
-    .object(
-        "sun",
-        root.clone(),
-        // 1 AU beyond Earth (+z, away from the camera), tilted toward screen-left.
-        point(axis_offset(EARTH_SUN_M, SUN_FRAMING_RAD, false)),
-        body("Sun", SUN),
-    )
-    .object(
-        "moon",
-        root,
-        // 384 400 km beyond Earth (+z, far side), tilted toward screen-right.
-        point(axis_offset(EARTH_MOON_M, MOON_FRAMING_RAD, false)),
-        body("Moon", MOON),
-    );
-    tx.commit();
+    DemoProducer.populate(&mut store.writer("demo"));
     store
 }
 
@@ -221,6 +236,14 @@ mod tests {
         labels.sort_unstable();
         assert_eq!(labels, ["Earth", "Moon", "Sun"]);
         assert!(snap.objects().iter().all(|o| o.kind == ObjectKind::Body));
+    }
+
+    #[test]
+    fn demo_producer_populates_a_writer() {
+        // The demo's body placement is a Producer; running it into a writer fills the store.
+        let store = SceneStore::new();
+        DemoProducer.populate(&mut store.writer("demo"));
+        assert_eq!(store.snapshot().objects().len(), 3);
     }
 
     #[test]

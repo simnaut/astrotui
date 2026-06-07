@@ -33,6 +33,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "astrodyn_frame_doc"
+version = "0.2.0"
+source = "git+https://github.com/simnaut/astrodyn?rev=045804f9fa895fba6682c6c424ef949fbadf305b#045804f9fa895fba6682c6c424ef949fbadf305b"
+dependencies = [
+ "astrodyn_quantities",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "astrodyn_frames"
 version = "0.2.0"
 source = "git+https://github.com/simnaut/astrodyn?rev=045804f9fa895fba6682c6c424ef949fbadf305b#045804f9fa895fba6682c6c424ef949fbadf305b"
@@ -72,6 +83,7 @@ version = "0.2.0"
 source = "git+https://github.com/simnaut/astrodyn?rev=045804f9fa895fba6682c6c424ef949fbadf305b#045804f9fa895fba6682c6c424ef949fbadf305b"
 dependencies = [
  "glam",
+ "serde",
  "thiserror 2.0.18",
  "typenum",
  "uom",
@@ -123,7 +135,10 @@ dependencies = [
 name = "astrotui-wire"
 version = "0.0.0"
 dependencies = [
+ "astrodyn_frame_doc",
  "astrodyn_quantities",
+ "astrotui-core",
+ "glam",
 ]
 
 [[package]]

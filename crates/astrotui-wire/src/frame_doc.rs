@@ -23,6 +23,15 @@ pub enum ApplyError {
     /// The header (schema version / conventions) or structure failed validation — the
     /// keyframe handshake rejected the document before any state was applied.
     Invalid(DocError),
+    /// A record names a `parent` uid that no record in the set provides — a dangling parent
+    /// (the RFS-301/302 transplant guard against a stale-parent ~10⁵ km failure). astrodyn's
+    /// `validate` only checks the parent *index* is in range, not that it refers to a record.
+    DanglingParent {
+        /// The record whose parent is missing.
+        child: FrameUid,
+        /// The named-but-absent parent.
+        parent: FrameUid,
+    },
     /// The requested segment/epoch index is out of range for the series.
     NoSuchEpoch,
 }
@@ -37,6 +46,12 @@ impl std::fmt::Display for ApplyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ApplyError::Invalid(e) => write!(f, "invalid frame document (keyframe handshake): {e}"),
+            ApplyError::DanglingParent { child, parent } => {
+                write!(
+                    f,
+                    "frame {child} names parent {parent}, which has no record"
+                )
+            }
             ApplyError::NoSuchEpoch => write!(f, "series segment/epoch index out of range"),
         }
     }
@@ -113,9 +128,32 @@ fn stage_records(tx: &mut Transaction, uids: &[FrameUid], records: &[FrameRecord
 /// literal-constructed documents (validation is the single choke point).
 pub fn apply_document(doc: &FrameDocument, w: &mut SceneWriter) -> Result<(), ApplyError> {
     doc.validate()?;
+    check_parents(&doc.uids, &doc.records)?;
     let mut tx = w.begin(tx_epoch(&doc.records));
     stage_records(&mut tx, &doc.uids, &doc.records);
     tx.commit();
+    Ok(())
+}
+
+/// Verify every record's `parent` uid is provided by some record in the set (the per-record
+/// parent self-check against the folded topology). `astrodyn_frame_doc::validate` checks a
+/// parent *index* is in range but not that it names an existing record, so a dangling parent
+/// slips past it — caught loudly here. Call after `validate()` (indices are assumed in range).
+fn check_parents(uids: &[FrameUid], records: &[FrameRecord]) -> Result<(), ApplyError> {
+    let mut provided = vec![false; uids.len()];
+    for r in records {
+        provided[r.uid_index as usize] = true;
+    }
+    for r in records {
+        if let Some(p) = r.parent {
+            if !provided[p as usize] {
+                return Err(ApplyError::DanglingParent {
+                    child: uids[r.uid_index as usize].clone(),
+                    parent: uids[p as usize].clone(),
+                });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -133,6 +171,7 @@ pub fn apply_series_epoch(
         .get(segment)
         .and_then(|s| s.epochs.get(epoch))
         .ok_or(ApplyError::NoSuchEpoch)?;
+    check_parents(&series.uids, &row.records)?;
     let mut tx = w.begin(tx_epoch(&row.records));
     stage_records(&mut tx, &series.uids, &row.records);
     tx.commit();
@@ -170,7 +209,7 @@ mod tests {
     use astrodyn_frame_doc::{
         Conventions, DocHeader, Origin, SeriesBuilder, TransRecord, SCHEMA_VERSION,
     };
-    use astrodyn_quantities::{Moon, PlanetFixed, RootInertial};
+    use astrodyn_quantities::{Mars, Moon, PlanetFixed, RootInertial};
     use astrotui_core::scene::SceneStore;
 
     fn header() -> DocHeader {
@@ -317,6 +356,31 @@ mod tests {
         let err = apply_document(&doc, &mut store.writer("wire")).unwrap_err();
         assert!(matches!(err, ApplyError::Invalid(_)));
         assert!(store.snapshot().is_empty());
+    }
+
+    #[test]
+    fn rejects_dangling_parent() {
+        // A record names a parent uid that no record provides. astrodyn `validate` passes
+        // (the parent index is in range), but the per-record self-check rejects it loudly and
+        // commits nothing — the RFS-301/302 stale-parent guard.
+        let doc = FrameDocument {
+            header: header(),
+            uids: vec![root_uid(), child_uid(), FrameUid::of::<PlanetFixed<Mars>>()],
+            records: vec![
+                rec("root", 0, None, 0.0, [0.0; 3], ident()),
+                // parent index 2 = Mars uid, but no record has uid_index 2 → dangling.
+                rec("moon", 1, Some(2), 0.0, [0.0; 3], ident()),
+            ],
+        };
+        doc.validate()
+            .expect("astrodyn validate passes: parent index is in range");
+        let store = SceneStore::new();
+        let err = apply_document(&doc, &mut store.writer("wire")).unwrap_err();
+        assert!(matches!(err, ApplyError::DanglingParent { .. }));
+        assert!(
+            store.snapshot().is_empty(),
+            "nothing committed on dangling parent"
+        );
     }
 
     #[test]

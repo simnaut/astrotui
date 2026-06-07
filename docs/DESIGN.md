@@ -670,9 +670,12 @@ flowchart TD
 6. **Ingestion is scoped layers**: named `SceneWriter`s own disjoint id sets;
    `commit()` replaces only that layer; render = live union; independent lifecycle
    *and* cadence per producer.
-7. **Interchange is one self-describing stream** (`astrotui-wire`): header
-   (topology + metadata) + frame-tagged samples; serves socket, telemetry, and
-   replay identically; replayable without the producer's code.
+7. **Frame interchange is `astrodyn_frame_doc`** (astrodyn #659): a keyframe
+   (`DocHeader` + interned `FrameUid` table) then per-epoch `EpochRow` records —
+   bit-exact, validated, replayable without the producer's code. `astrotui-wire` is
+   the **outer framing** (the socket keyframe handshake + the object/scene records
+   that ride alongside, referencing frames by `FrameUid`); it serves socket,
+   telemetry, and replay identically.
 8. **Snapshot / double-buffer** decouples producer rate from TUI frame rate;
    states kept in natural frames, camera applied per-render.
 9. **Trails are a plugin-provided container, producer-populated** at full rate;

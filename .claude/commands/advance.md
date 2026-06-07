@@ -29,7 +29,7 @@ GitHub — never assume memory from a prior run.
 - **Merge gate:** `main` is protected (squash-only, no direct pushes, enforced for
   admins) and requires **four** status checks green before merge — `test`, `firewall`,
   `claude-review` (an **independent CI review** that runs automatically on every PR), and
-  `mermaid` (validates ` ```mermaid ` diagrams in tracked markdown).
+  `mermaid` (validates fenced mermaid diagram blocks in tracked markdown).
   Review findings — from the CI review and the repo's Copilot reviewer — are posted as
   inline review threads that must be resolved before merge (required conversation
   resolution). This loop does NOT self-review — it responds to those reviews (Phase A).

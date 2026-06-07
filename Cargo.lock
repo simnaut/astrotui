@@ -35,17 +35,18 @@ dependencies = [
 [[package]]
 name = "astrodyn_frames"
 version = "0.2.0"
-source = "git+https://github.com/simnaut/astrodyn?rev=0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb#0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb"
+source = "git+https://github.com/simnaut/astrodyn?rev=045804f9fa895fba6682c6c424ef949fbadf305b#045804f9fa895fba6682c6c424ef949fbadf305b"
 dependencies = [
  "astrodyn_math",
  "astrodyn_quantities",
  "glam",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "astrodyn_math"
 version = "0.2.0"
-source = "git+https://github.com/simnaut/astrodyn?rev=0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb#0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb"
+source = "git+https://github.com/simnaut/astrodyn?rev=045804f9fa895fba6682c6c424ef949fbadf305b#045804f9fa895fba6682c6c424ef949fbadf305b"
 dependencies = [
  "astrodyn_quantities",
  "glam",
@@ -56,7 +57,7 @@ dependencies = [
 [[package]]
 name = "astrodyn_planet"
 version = "0.2.0"
-source = "git+https://github.com/simnaut/astrodyn?rev=0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb#0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb"
+source = "git+https://github.com/simnaut/astrodyn?rev=045804f9fa895fba6682c6c424ef949fbadf305b#045804f9fa895fba6682c6c424ef949fbadf305b"
 dependencies = [
  "astrodyn_quantities",
  "glam",
@@ -68,7 +69,7 @@ dependencies = [
 [[package]]
 name = "astrodyn_quantities"
 version = "0.2.0"
-source = "git+https://github.com/simnaut/astrodyn?rev=0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb#0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb"
+source = "git+https://github.com/simnaut/astrodyn?rev=045804f9fa895fba6682c6c424ef949fbadf305b#045804f9fa895fba6682c6c424ef949fbadf305b"
 dependencies = [
  "glam",
  "thiserror 2.0.18",
@@ -928,6 +929,7 @@ name = "orchestrator"
 version = "0.0.0"
 dependencies = [
  "astrodyn_planet",
+ "astrodyn_quantities",
  "astrotui-core",
  "astrotui-dem",
  "astrotui-render-braille",

@@ -15,12 +15,12 @@ pub mod testing;
 
 #[cfg(test)]
 mod astrodyn_surface {
-    //! Compile/link verification that the pinned astrodyn substrate (#8, post-#645)
+    //! Compile/link verification that the pinned astrodyn substrate (#8, post-#659)
     //! exposes the surface astrotui-core relies on. This is a resolution check — if the
     //! pin drifts and the API moves, this fails to compile rather than failing silently.
     use astrodyn_frames::{FrameId, FrameTree, RefFrameState};
     use astrodyn_planet::{PlanetShape, MOON};
-    use astrodyn_quantities::{CartesianState, Position, RootInertial, Velocity};
+    use astrodyn_quantities::{CartesianState, FrameUid, Position, RootInertial, Velocity};
 
     // Type-level references — fail to compile if any of these types are gone/renamed.
     #[allow(dead_code)]
@@ -41,6 +41,11 @@ mod astrodyn_surface {
         // bind it as a fn pointer so the exact signature is checked without a FrameTree.
         let _relative_state: fn(&FrameTree, FrameId, FrameId) -> RefFrameState =
             FrameTree::compute_relative_state;
+
+        // astrodyn #659 runtime-frame identity surface the core now builds on (DESIGN §3):
+        // FrameUid::of lowers a typed marker to a runtime uid; resolve maps it to a node.
+        let _of: fn() -> FrameUid = FrameUid::of::<RootInertial>;
+        let _resolve: fn(&FrameTree, &FrameUid) -> FrameId = FrameTree::resolve;
 
         // PlanetShape presets + accessors (r_eq/r_pol are private fields, read via methods).
         // `black_box` keeps clippy from folding these into constant assertions.

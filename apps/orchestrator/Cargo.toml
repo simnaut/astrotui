@@ -15,6 +15,7 @@ astrotui-render-graphics = { workspace = true }
 astrotui-wire = { workspace = true }
 astrotui-dem = { workspace = true }
 astrodyn_planet = { workspace = true }
+astrodyn_quantities = { workspace = true }
 ratatui = { workspace = true }
 glam = "0.30"
 

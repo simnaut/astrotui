@@ -19,14 +19,14 @@
 
 use std::collections::HashMap;
 
-use astrodyn_frames::{FrameTree, RefFrameState, RefFrameTrans};
-use astrodyn_quantities::FrameUid;
+use astrodyn_frames::{FrameTree, RefFrameRot, RefFrameState, RefFrameTrans};
+use astrodyn_quantities::{FrameUid, JeodQuat};
 use glam::{DMat3, DVec3};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::StatefulWidget;
 
-use crate::scene::{ObjectId, SceneStore, Snapshot};
+use crate::scene::{BodyState, ObjectId, SceneStore, Snapshot};
 
 /// The eye. In this skeleton it is a scene frame to sit in plus an orthographic scale; the
 /// full `Camera` (target, log-zoom, up, fov — DESIGN.md §4.4) lands with the camera presets
@@ -66,6 +66,10 @@ pub struct ProjectedPoint {
     pub row: f64,
     /// Position in the camera frame (metres) — retained for depth ordering / LOD later.
     pub pos_cam: DVec3,
+    /// The object's body axes expressed in **camera coordinates** (body → camera), composed
+    /// from the frame→camera rotation and the object's attitude. Identity until a producer
+    /// supplies attitude; consumed by oriented-ellipsoid LOD in P1/P2.
+    pub att_cam: DMat3,
 }
 
 /// Diagnostics from a projection pass: what could **not** be rendered, so the host can
@@ -136,12 +140,20 @@ pub fn project_points(
             (s.trans.position, s.rot.t_parent_this.transpose())
         });
         let pos_cam = origin + r_frame_to_cam * obj.state.position;
+        // Object body axes in camera coordinates: (frame→cam) ∘ (body→frame). The attitude is
+        // the object's body orientation in its native frame (parent→this), so the transpose of
+        // its parent→this matrix is body→frame.
+        let body_to_frame = JeodQuat::from_glam(obj.state.attitude)
+            .left_quat_to_transformation()
+            .transpose();
+        let att_cam = r_frame_to_cam * body_to_frame;
         if let Some((col, row)) = project_orthographic(pos_cam, camera.scale, area) {
             out.push(ProjectedPoint {
                 id: obj.id.clone(),
                 col,
                 row,
                 pos_cam,
+                att_cam,
             });
         }
     }
@@ -189,7 +201,7 @@ fn build_tree(snap: &Snapshot) -> (Option<FrameArena>, Vec<FrameUid>) {
                         parent_id,
                         fr.uid.clone(),
                         fr.uid.to_string(),
-                        trans_state(fr.state.position, fr.state.velocity),
+                        frame_state(&fr.state),
                         fr.epoch,
                     );
                     ids.insert(fr.uid.clone(), aid);
@@ -211,11 +223,23 @@ fn build_tree(snap: &Snapshot) -> (Option<FrameArena>, Vec<FrameUid>) {
     }
 }
 
-/// A translational-only frame state (identity rotation) at the given position/velocity.
-fn trans_state(position: DVec3, velocity: DVec3) -> RefFrameState {
+/// Build an astrodyn `RefFrameState` from a scene `BodyState`, carrying translation **and**
+/// rotation. The attitude (a glam `DQuat`, parent→this) converts losslessly to a `JeodQuat`
+/// (`from_glam` is the inverse of the wire's `rotation_to_dquat`); the matrix is re-derived
+/// from the quaternion (astrodyn RF.04). Angular velocity is zero — `BodyState` carries none.
+fn frame_state(s: &BodyState) -> RefFrameState {
+    let mut q = JeodQuat::from_glam(s.attitude);
+    q.normalize(); // a Matrix→DQuat conversion upstream may drift off unit norm
     RefFrameState {
-        trans: RefFrameTrans { position, velocity },
-        ..RefFrameState::default()
+        trans: RefFrameTrans {
+            position: s.position,
+            velocity: s.velocity,
+        },
+        rot: RefFrameRot {
+            q_parent_this: q,
+            t_parent_this: q.left_quat_to_transformation(),
+            ang_vel_this: DVec3::ZERO,
+        },
     }
 }
 

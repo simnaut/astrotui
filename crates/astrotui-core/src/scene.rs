@@ -6,20 +6,21 @@
 //! **union** of all layers — so each producer (a live sim, an ephemeris body-filler, a
 //! telemetry feed) has independent lifecycle and cadence without clobbering the others.
 //!
-//! This module is the ingestion machinery (#12) plus the per-object render-metadata
-//! model (#13): a [`SceneObject`] carries id/label/frame/kind/state/shape/path. The
-//! rolling trail (DESIGN.md §4.2 `trail`) is accumulated store-side and attaches in P2
-//! (#24); building an astrodyn `FrameTree` from the frame records and the render pass
-//! land in #14.
+//! Frame identity is **`astrodyn_quantities::FrameUid`** (astrodyn #659; DESIGN §3): a
+//! `FrameRecord` is keyed by its `uid`, and a [`SceneObject`]/[`crate::render::Camera`]
+//! names its frame by that uid. The uid carries the frame's class/role/tag, so there is no
+//! separate "kind" field — identity and classification are one value. Objects additionally
+//! carry id/label/kind/state/shape/path. The rolling trail (DESIGN.md §4.2 `trail`) is
+//! accumulated store-side and attaches in P2 (#24).
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
 use astrodyn_planet::PlanetShape;
-use astrodyn_quantities::{SecondsSince, TDB};
+use astrodyn_quantities::{FrameUid, SecondsSince, TDB};
 use glam::{DQuat, DVec3};
 
 /// Epoch a sample is stamped with — TDB seconds, the wire-format epoch (DESIGN.md §4.3).
@@ -57,10 +58,6 @@ macro_rules! string_id {
 }
 
 string_id!(
-    /// Stable id of a frame node, as declared by a producer (e.g. `"moon_fixed"`).
-    FrameId
-);
-string_id!(
     /// Stable id of a scene object, as declared by a producer (e.g. `"lander"`).
     ObjectId
 );
@@ -91,14 +88,18 @@ impl Default for BodyState {
     }
 }
 
-/// A frame node: its parent in the tree and its state relative to that parent.
-/// `parent == None` marks the root frame.
+/// A frame node: its identity, its parent in the tree, and its state relative to that
+/// parent. `parent == None` marks a root frame. Identity is a `FrameUid` (astrodyn #659),
+/// which carries the frame's class/role/tag — so the uid is both the handle (resolution /
+/// dangling-detection) and the classification.
 #[derive(Clone, Debug)]
 pub struct FrameRecord {
-    /// This frame's stable id.
-    pub id: FrameId,
-    /// Parent frame id, or `None` for the root.
-    pub parent: Option<FrameId>,
+    /// This frame's identity (carries class/role/tag).
+    pub uid: FrameUid,
+    /// Parent frame's identity, or `None` for a root.
+    pub parent: Option<FrameUid>,
+    /// Frame epoch: the time-validity of this state (DESIGN §4.3 / astrodyn RFS-603).
+    pub epoch: Option<Epoch>,
     /// State of this frame relative to its parent.
     pub state: BodyState,
 }
@@ -143,7 +144,7 @@ pub struct Path {
 }
 
 /// Per-object render metadata supplied with a state on [`Transaction::object`] — the
-/// `meta` of DESIGN.md §4.1's `tx.object(obj_id, frame_id, state, meta)`.
+/// `meta` of DESIGN.md §4.1's `tx.object(obj_id, frame_uid, state, meta)`.
 #[derive(Clone, Debug, Default)]
 pub struct ObjectMeta {
     /// Human label shown in the camera/frame switcher UI.
@@ -166,8 +167,8 @@ pub struct SceneObject {
     pub id: ObjectId,
     /// Human label for UI enumeration.
     pub label: Cow<'static, str>,
-    /// The frame this object lives in.
-    pub frame: FrameId,
+    /// Identity of the frame this object lives in (astrodyn #659).
+    pub frame: FrameUid,
     /// What the object is.
     pub kind: ObjectKind,
     /// State in the object's native `frame`.
@@ -182,7 +183,9 @@ pub struct SceneObject {
 #[derive(Clone, Default)]
 struct Layer {
     epoch: Option<Epoch>,
-    frames: BTreeMap<FrameId, FrameRecord>,
+    /// Frame nodes keyed by identity. `FrameUid` is `Hash + Eq` but not `Ord`
+    /// (`Tag` holds a `Box<str>`), so this is a `HashMap`, not a `BTreeMap`.
+    frames: HashMap<FrameUid, FrameRecord>,
     objects: BTreeMap<ObjectId, SceneObject>,
 }
 
@@ -197,7 +200,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// All frame nodes across the union of layers (ascending by id).
+    /// All frame nodes across the union of layers (ordered deterministically by uid).
     #[must_use]
     pub fn frames(&self) -> &[FrameRecord] {
         &self.frames
@@ -238,22 +241,27 @@ impl Inner {
     /// Producers own disjoint id sets (DESIGN.md §4.1); if two layers nonetheless declare
     /// the same id, the layer later in `LayerId` order wins, deterministically.
     fn rebuild(layers: &BTreeMap<LayerId, Layer>) -> Snapshot {
-        let mut frames: BTreeMap<FrameId, FrameRecord> = BTreeMap::new();
+        let mut frames: HashMap<FrameUid, FrameRecord> = HashMap::new();
         let mut objects: BTreeMap<ObjectId, SceneObject> = BTreeMap::new();
         let mut layer_epochs = Vec::new();
         for (layer_id, layer) in layers {
             if let Some(epoch) = layer.epoch {
                 layer_epochs.push((layer_id.clone(), epoch));
             }
-            for (id, rec) in &layer.frames {
-                frames.insert(id.clone(), rec.clone());
+            for (uid, rec) in &layer.frames {
+                frames.insert(uid.clone(), rec.clone());
             }
             for (id, rec) in &layer.objects {
                 objects.insert(id.clone(), rec.clone());
             }
         }
+        // `FrameUid` isn't `Ord`, so sort the union by its `Display` for a deterministic
+        // frame order (golden frames, stable diagnostics). Object order is `ObjectId`-sorted
+        // by the `BTreeMap`.
+        let mut frames: Vec<FrameRecord> = frames.into_values().collect();
+        frames.sort_by(|a, b| a.uid.to_string().cmp(&b.uid.to_string()));
         Snapshot {
-            frames: frames.into_values().collect(),
+            frames,
             objects: objects.into_values().collect(),
             layer_epochs,
         }
@@ -343,26 +351,34 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    /// Stage a frame node (its parent and state relative to that parent).
+    /// Stage a frame node by its `uid` (its parent and state relative to that parent). The
+    /// frame's epoch is the transaction's epoch.
     pub fn frame(
         &mut self,
-        id: impl Into<FrameId>,
-        parent: Option<FrameId>,
+        uid: FrameUid,
+        parent: Option<FrameUid>,
         state: BodyState,
     ) -> &mut Self {
-        let id = id.into();
-        self.staged
-            .frames
-            .insert(id.clone(), FrameRecord { id, parent, state });
+        let epoch = self.staged.epoch;
+        self.staged.frames.insert(
+            uid.clone(),
+            FrameRecord {
+                uid,
+                parent,
+                epoch,
+                state,
+            },
+        );
         self
     }
 
-    /// Stage an object placed on `frame`, with `state` in that native frame and render
-    /// `meta` — DESIGN.md §4.1's `tx.object(obj_id, frame_id, state, meta)`.
+    /// Stage an object placed on the frame named by `frame` (a [`FrameUid`]), with `state`
+    /// in that native frame and render `meta` — DESIGN.md §4.1's
+    /// `tx.object(obj_id, frame_uid, state, meta)`.
     pub fn object(
         &mut self,
         id: impl Into<ObjectId>,
-        frame: impl Into<FrameId>,
+        frame: FrameUid,
         state: BodyState,
         meta: ObjectMeta,
     ) -> &mut Self {
@@ -372,7 +388,7 @@ impl Transaction {
             SceneObject {
                 id,
                 label: meta.label,
-                frame: frame.into(),
+                frame,
                 kind: meta.kind,
                 state,
                 shape: meta.shape,
@@ -403,6 +419,7 @@ impl Transaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astrodyn_quantities::{Moon, PlanetFixed, RootInertial};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
@@ -414,6 +431,13 @@ mod tests {
     }
     fn ep(s: f64) -> Epoch {
         Epoch::from_seconds(s)
+    }
+    // Two distinct, real frame identities for the store machinery tests.
+    fn f_root() -> FrameUid {
+        FrameUid::of::<RootInertial>()
+    }
+    fn f_moon() -> FrameUid {
+        FrameUid::of::<PlanetFixed<Moon>>()
     }
     fn obj_ids(snap: &Snapshot) -> Vec<&str> {
         snap.objects().iter().map(|o| o.id.as_str()).collect()
@@ -434,9 +458,9 @@ mod tests {
 
         let w = store.writer("sim");
         let mut tx = w.begin(ep(100.0));
-        tx.frame("root", None, BodyState::default())
-            .frame("moon_fixed", Some("root".into()), st(1.0))
-            .object("lander", "moon_fixed", st(2.0), m());
+        tx.frame(f_root(), None, BodyState::default())
+            .frame(f_moon(), Some(f_root()), st(1.0))
+            .object("lander", f_moon(), st(2.0), m());
         tx.commit();
 
         let snap = store.snapshot();
@@ -449,11 +473,11 @@ mod tests {
     fn layers_union_and_isolate() {
         let store = SceneStore::new();
         let mut tx = store.writer("sim").begin(ep(1.0));
-        tx.object("lander", "moon_fixed", st(1.0), m());
+        tx.object("lander", f_moon(), st(1.0), m());
         tx.commit();
         let mut tx = store.writer("ephemeris").begin(ep(2.0));
-        tx.object("moon", "root", st(2.0), m())
-            .object("earth", "root", st(3.0), m());
+        tx.object("moon", f_root(), st(2.0), m())
+            .object("earth", f_root(), st(3.0), m());
         tx.commit();
 
         let snap = store.snapshot();
@@ -463,7 +487,7 @@ mod tests {
 
         // Re-committing "sim" replaces only that layer; "ephemeris" persists untouched.
         let mut tx = store.writer("sim").begin(ep(5.0));
-        tx.object("orbiter", "moon_fixed", st(9.0), m());
+        tx.object("orbiter", f_moon(), st(9.0), m());
         tx.commit();
         let snap = store.snapshot();
         assert_eq!(obj_ids(&snap), ["earth", "moon", "orbiter"]); // lander gone, bodies stay
@@ -474,13 +498,13 @@ mod tests {
     fn old_snapshot_is_immutable_across_commit() {
         let store = SceneStore::new();
         let mut tx = store.writer("sim").begin(ep(1.0));
-        tx.object("a", "f", st(1.0), m());
+        tx.object("a", f_root(), st(1.0), m());
         tx.commit();
         let old = store.snapshot();
 
         let mut tx = store.writer("sim").begin(ep(2.0));
-        tx.object("a", "f", st(1.0), m())
-            .object("b", "f", st(2.0), m());
+        tx.object("a", f_root(), st(1.0), m())
+            .object("b", f_root(), st(2.0), m());
         tx.commit();
 
         assert_eq!(obj_ids(&old), ["a"]); // previously-loaded snapshot unchanged
@@ -495,7 +519,7 @@ mod tests {
         let mut tx = store.writer("sim").begin(ep(0.0));
         tx.object(
             "lander",
-            "moon_fixed",
+            f_moon(),
             st(1.0),
             ObjectMeta {
                 label: "LM".into(),
@@ -516,7 +540,7 @@ mod tests {
         assert_eq!(lander.path.as_ref().unwrap().points.len(), 2);
         // An object committed without metadata gets the defaults.
         let mut tx = store.writer("eph").begin(ep(0.0));
-        tx.object("moon", "root", st(0.0), m());
+        tx.object("moon", f_root(), st(0.0), m());
         tx.commit();
         let snap = store.snapshot();
         let moon = snap
@@ -532,7 +556,7 @@ mod tests {
     fn writer_is_send_and_concurrent_reads_stay_consistent() {
         let store = SceneStore::new();
         let mut tx = store.writer("sim").begin(ep(0.0));
-        tx.object("a", "f", st(0.0), m());
+        tx.object("a", f_root(), st(0.0), m());
         tx.commit();
 
         let writer = store.writer("sim"); // Send + Clone, moved to the producer thread
@@ -542,9 +566,9 @@ mod tests {
             let mut n = 0u64;
             while !stop_w.load(Ordering::Relaxed) {
                 let mut tx = writer.begin(ep(n as f64));
-                tx.object("a", "f", st(0.0), m());
+                tx.object("a", f_root(), st(0.0), m());
                 if n.is_multiple_of(2) {
-                    tx.object("b", "f", st(1.0), m());
+                    tx.object("b", f_root(), st(1.0), m());
                 }
                 tx.commit();
                 n += 1;

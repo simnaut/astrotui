@@ -33,11 +33,14 @@ astrotui-wire = { path = "crates/astrotui-wire" }
 astrotui-dem = { path = "crates/astrotui-dem" }
 
 # astrodyn substrate — pinned by git rev for reproducibility (#8). The pure,
-# Bevy-free, ANISE-free trio. astrodyn_ephemeris is intentionally NOT pinned here:
+# Bevy-free, ANISE-free crates. astrodyn_ephemeris is intentionally NOT pinned here:
 # it enters only through producers, never the render core (DESIGN.md §12 firewall).
-astrodyn_frames = { git = "https://github.com/simnaut/astrodyn", rev = "0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb" }
-astrodyn_quantities = { git = "https://github.com/simnaut/astrodyn", rev = "0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb" }
-astrodyn_planet = { git = "https://github.com/simnaut/astrodyn", rev = "0f78ef96ad803a1ced5f8fd1fa1d0f720300adfb" }
+# Pinned to a post-#659 rev: FrameUid identity + astrodyn_frame_doc (DESIGN §3, §4.3).
+astrodyn_frames = { git = "https://github.com/simnaut/astrodyn", rev = "045804f9fa895fba6682c6c424ef949fbadf305b" }
+astrodyn_quantities = { git = "https://github.com/simnaut/astrodyn", rev = "045804f9fa895fba6682c6c424ef949fbadf305b" }
+astrodyn_planet = { git = "https://github.com/simnaut/astrodyn", rev = "045804f9fa895fba6682c6c424ef949fbadf305b" }
+# Frame-document wire schema (astrodyn #659) — consumed by astrotui-wire (#75).
+astrodyn_frame_doc = { git = "https://github.com/simnaut/astrodyn", rev = "045804f9fa895fba6682c6c424ef949fbadf305b" }
 
 # ratatui — shared across core + the render backends so the Buffer type in the
 # Renderer trait is the same everywhere.

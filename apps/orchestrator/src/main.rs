@@ -23,6 +23,7 @@ use std::io;
 use std::time::Duration;
 
 use astrodyn_planet::{PlanetShape, EARTH, MOON, SUN};
+use astrodyn_quantities::{FrameUid, RootInertial};
 use astrotui_core::render::Renderer;
 use astrotui_core::scene::{BodyShape, BodyState, Epoch, ObjectKind, ObjectMeta, SceneStore};
 use astrotui_render_braille::BrailleRenderer;
@@ -67,23 +68,29 @@ fn fov_half_tan() -> f64 {
 /// degrees off the view axis so the camera frames three separate discs with Earth dominant.
 fn build_scene() -> SceneStore {
     let store = SceneStore::new();
+    let root = FrameUid::of::<RootInertial>();
     let mut tx = store.writer("demo").begin(Epoch::from_seconds(0.0));
-    tx.frame("root", None, BodyState::default());
-    tx.object("earth", "root", point(DVec3::ZERO), body("Earth", EARTH))
-        .object(
-            "sun",
-            "root",
-            // 1 AU beyond Earth (+z, away from the camera), tilted toward screen-left.
-            point(axis_offset(EARTH_SUN_M, SUN_FRAMING_RAD, false)),
-            body("Sun", SUN),
-        )
-        .object(
-            "moon",
-            "root",
-            // 384 400 km beyond Earth (+z, far side), tilted toward screen-right.
-            point(axis_offset(EARTH_MOON_M, MOON_FRAMING_RAD, false)),
-            body("Moon", MOON),
-        );
+    tx.frame(root.clone(), None, BodyState::default());
+    tx.object(
+        "earth",
+        root.clone(),
+        point(DVec3::ZERO),
+        body("Earth", EARTH),
+    )
+    .object(
+        "sun",
+        root.clone(),
+        // 1 AU beyond Earth (+z, away from the camera), tilted toward screen-left.
+        point(axis_offset(EARTH_SUN_M, SUN_FRAMING_RAD, false)),
+        body("Sun", SUN),
+    )
+    .object(
+        "moon",
+        root,
+        // 384 400 km beyond Earth (+z, far side), tilted toward screen-right.
+        point(axis_offset(EARTH_MOON_M, MOON_FRAMING_RAD, false)),
+        body("Moon", MOON),
+    );
     tx.commit();
     store
 }

@@ -19,32 +19,33 @@
 
 use std::collections::HashMap;
 
-use astrodyn_frames::{FrameTree, RefFrameKind, RefFrameState, RefFrameTrans};
+use astrodyn_frames::{FrameTree, RefFrameState, RefFrameTrans};
+use astrodyn_quantities::FrameUid;
 use glam::{DMat3, DVec3};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::StatefulWidget;
 
-use crate::scene::{FrameId, ObjectId, SceneStore, Snapshot};
+use crate::scene::{ObjectId, SceneStore, Snapshot};
 
 /// The eye. In this skeleton it is a scene frame to sit in plus an orthographic scale; the
 /// full `Camera` (target, log-zoom, up, fov — DESIGN.md §4.4) lands with the camera presets
 /// and seamless zoom in P1.
 #[derive(Clone, Debug)]
 pub struct Camera {
-    /// The scene frame the eye sits in / is oriented by.
-    pub frame: FrameId,
+    /// Identity of the scene frame the eye sits in / is oriented by (astrodyn #659).
+    pub frame: FrameUid,
     /// Orthographic scale: metres per terminal cell. Replaced by log-zoom in P1.
     pub scale: f64,
 }
 
 impl Camera {
-    /// A scene overview anchored in `frame` (the root inertial frame), at `metres_per_cell`
-    /// orthographic scale.
+    /// A scene overview anchored in the frame named by `frame` (e.g.
+    /// `FrameUid::of::<RootInertial>()`), at `metres_per_cell` orthographic scale.
     #[must_use]
-    pub fn overview(frame: impl Into<FrameId>, metres_per_cell: f64) -> Self {
+    pub fn overview(frame: FrameUid, metres_per_cell: f64) -> Self {
         Self {
-            frame: frame.into(),
+            frame,
             scale: metres_per_cell,
         }
     }
@@ -110,13 +111,14 @@ pub fn project_points(snap: &Snapshot, camera: &Camera, area: Rect) -> Vec<Proje
 }
 
 /// Build an astrodyn `FrameTree` from the snapshot's frame records, returning it alongside
-/// a map from scene [`FrameId`] to the arena's `usize` frame id. Frames are added
-/// parent-before-child; frames whose parent is missing are dropped. `None` if there are no
-/// frames. Frame *kind* and *orientation* are simplified here (all `Inertial`, identity
-/// rotation) — sufficient for the translational overview; rotating frames land in P2.
-fn build_tree(snap: &Snapshot) -> Option<(FrameTree, HashMap<FrameId, usize>)> {
+/// a map from scene [`FrameUid`] to the arena's `usize` frame id. Frames are stamped by
+/// their uid (astrodyn #659) and added parent-before-child; frames whose parent is missing
+/// are dropped. `None` if there are no frames. Frame *orientation* is simplified here
+/// (translational placement, identity rotation) — sufficient for the overview; rotating
+/// frames land in P2. (Loud surfacing of dropped/dangling frames is #76.)
+fn build_tree(snap: &Snapshot) -> Option<(FrameTree, HashMap<FrameUid, usize>)> {
     let mut tree = FrameTree::new();
-    let mut ids: HashMap<FrameId, usize> = HashMap::new();
+    let mut ids: HashMap<FrameUid, usize> = HashMap::new();
     let mut remaining: Vec<_> = snap.frames().iter().collect();
 
     let mut progress = true;
@@ -124,23 +126,29 @@ fn build_tree(snap: &Snapshot) -> Option<(FrameTree, HashMap<FrameId, usize>)> {
         progress = false;
         remaining.retain(|fr| match &fr.parent {
             None => {
-                // Root state is the inertial origin (identity); any supplied state is ignored.
+                // A root frame's identity must be root-eligible; drop a malformed root
+                // rather than panicking in the render path (loud surfacing is #76). Root
+                // state is the inertial origin (identity); any supplied state is ignored.
+                if !fr.uid.class.may_be_root_or_integ() {
+                    return false;
+                }
                 ids.insert(
-                    fr.id.clone(),
-                    tree.add_root(fr.id.to_string(), RefFrameKind::Inertial),
+                    fr.uid.clone(),
+                    tree.add_root_uid(fr.uid.clone(), fr.uid.to_string()),
                 );
                 progress = true;
                 false
             }
             Some(parent) => match ids.get(parent) {
                 Some(&parent_id) => {
-                    let aid = tree.add_child(
+                    let aid = tree.add_child_uid(
                         parent_id,
-                        fr.id.to_string(),
-                        RefFrameKind::Inertial,
+                        fr.uid.clone(),
+                        fr.uid.to_string(),
                         trans_state(fr.state.position, fr.state.velocity),
+                        fr.epoch,
                     );
-                    ids.insert(fr.id.clone(), aid);
+                    ids.insert(fr.uid.clone(), aid);
                     progress = true;
                     false
                 }
@@ -230,6 +238,7 @@ impl StatefulWidget for SpaceView<'_> {
 mod tests {
     use super::*;
     use crate::scene::{BodyState, Epoch, ObjectMeta, SceneStore};
+    use astrodyn_quantities::{Mars, Moon, PlanetFixed, RootInertial};
 
     fn area() -> Rect {
         Rect::new(0, 0, 20, 10) // centre at (10, 5)
@@ -240,14 +249,25 @@ mod tests {
             ..BodyState::default()
         }
     }
+    // Distinct, real frame identities for the projection tests. `root` is the inertial
+    // root; `child` is any distinct child-frame node; `absent` is never placed in a scene.
+    fn root() -> FrameUid {
+        FrameUid::of::<RootInertial>()
+    }
+    fn child() -> FrameUid {
+        FrameUid::of::<PlanetFixed<Moon>>()
+    }
+    fn absent() -> FrameUid {
+        FrameUid::of::<PlanetFixed<Mars>>()
+    }
 
-    // Build a one-frame ("root") scene with the given objects, then snapshot it.
+    // Build a one-frame (root) scene with the given objects, then snapshot it.
     fn scene(objects: &[(&str, BodyState)]) -> std::sync::Arc<crate::scene::Snapshot> {
         let store = SceneStore::new();
         let mut tx = store.writer("p").begin(Epoch::from_seconds(0.0));
-        tx.frame("root", None, BodyState::default());
+        tx.frame(root(), None, BodyState::default());
         for (id, st) in objects {
-            tx.object(*id, "root", *st, ObjectMeta::default());
+            tx.object(*id, root(), *st, ObjectMeta::default());
         }
         tx.commit();
         store.snapshot()
@@ -256,7 +276,7 @@ mod tests {
     #[test]
     fn projects_to_viewport_centre_and_offsets() {
         let snap = scene(&[("origin", at(0.0, 0.0)), ("right", at(4.0, 0.0))]);
-        let cam = Camera::overview("root", 2.0); // 2 m per cell
+        let cam = Camera::overview(root(), 2.0); // 2 m per cell
         let pts = project_points(&snap, &cam, area());
 
         let origin = pts.iter().find(|p| p.id.as_str() == "origin").unwrap();
@@ -269,7 +289,7 @@ mod tests {
     fn projection_is_local_to_the_area_offset() {
         // The same object projects to the same LOCAL (col, row) wherever the area sits.
         let snap = scene(&[("o", at(0.0, 0.0))]);
-        let cam = Camera::overview("root", 1.0);
+        let cam = Camera::overview(root(), 1.0);
         let p0 = project_points(&snap, &cam, Rect::new(0, 0, 20, 10));
         let p1 = project_points(&snap, &cam, Rect::new(7, 3, 20, 10));
         assert_eq!((p0[0].col, p0[0].row), (10.0, 5.0));
@@ -281,26 +301,26 @@ mod tests {
         // A child frame offset +100 m in x under root; an object +5 m in x within it.
         let store = SceneStore::new();
         let mut tx = store.writer("p").begin(Epoch::from_seconds(0.0));
-        tx.frame("root", None, BodyState::default())
-            .frame("ship", Some("root".into()), at(100.0, 0.0))
-            .object("probe", "ship", at(5.0, 0.0), ObjectMeta::default());
+        tx.frame(root(), None, BodyState::default())
+            .frame(child(), Some(root()), at(100.0, 0.0))
+            .object("probe", child(), at(5.0, 0.0), ObjectMeta::default());
         tx.commit();
         let snap = store.snapshot();
 
         // From the root camera, the probe sits at 105 m in x.
         let pts = project_points(
             &snap,
-            &Camera::overview("root", 1.0),
+            &Camera::overview(root(), 1.0),
             Rect::new(0, 0, 400, 10),
         );
         let probe = pts.iter().find(|p| p.id.as_str() == "probe").unwrap();
         assert_eq!(probe.pos_cam.x, 105.0);
         assert_eq!((probe.col, probe.row), (305.0, 5.0)); // centre 200 + 105 m
 
-        // From a camera riding "ship", the same probe is only 5 m in x.
+        // From a camera riding the child frame, the same probe is only 5 m in x.
         let pts = project_points(
             &snap,
-            &Camera::overview("ship", 1.0),
+            &Camera::overview(child(), 1.0),
             Rect::new(0, 0, 40, 10),
         );
         let probe = pts.iter().find(|p| p.id.as_str() == "probe").unwrap();
@@ -313,16 +333,16 @@ mod tests {
         // Two objects share an offset child frame; each picks up that frame's transform.
         let store = SceneStore::new();
         let mut tx = store.writer("p").begin(Epoch::from_seconds(0.0));
-        tx.frame("root", None, BodyState::default())
-            .frame("ship", Some("root".into()), at(100.0, 0.0))
-            .object("nose", "ship", at(1.0, 0.0), ObjectMeta::default())
-            .object("tail", "ship", at(-1.0, 0.0), ObjectMeta::default());
+        tx.frame(root(), None, BodyState::default())
+            .frame(child(), Some(root()), at(100.0, 0.0))
+            .object("nose", child(), at(1.0, 0.0), ObjectMeta::default())
+            .object("tail", child(), at(-1.0, 0.0), ObjectMeta::default());
         tx.commit();
         let snap = store.snapshot();
 
         let pts = project_points(
             &snap,
-            &Camera::overview("root", 1.0),
+            &Camera::overview(root(), 1.0),
             Rect::new(0, 0, 400, 10),
         );
         let nose = pts.iter().find(|p| p.id.as_str() == "nose").unwrap();
@@ -350,7 +370,7 @@ mod tests {
                 },
             ),
         ]);
-        let pts = project_points(&snap, &Camera::overview("root", 1.0), area());
+        let pts = project_points(&snap, &Camera::overview(root(), 1.0), area());
         let ids: Vec<&str> = pts.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["ok"]); // NaN/∞ objects are dropped, not mapped to (0,0)
     }
@@ -358,7 +378,7 @@ mod tests {
     #[test]
     fn offscreen_objects_are_culled() {
         let snap = scene(&[("near", at(0.0, 0.0)), ("far", at(1_000.0, 0.0))]);
-        let pts = project_points(&snap, &Camera::overview("root", 1.0), area());
+        let pts = project_points(&snap, &Camera::overview(root(), 1.0), area());
         let ids: Vec<&str> = pts.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["near"]); // "far" is off the 20-wide viewport
     }
@@ -366,10 +386,11 @@ mod tests {
     #[test]
     fn empty_or_unknown_camera_frame_yields_nothing() {
         let snap = scene(&[("a", at(0.0, 0.0))]);
-        assert!(project_points(&snap, &Camera::overview("nope", 1.0), area()).is_empty());
-        assert!(project_points(&snap, &Camera::overview("root", 0.0), area()).is_empty());
+        // `absent` is a valid identity that is simply not present in this scene.
+        assert!(project_points(&snap, &Camera::overview(absent(), 1.0), area()).is_empty());
+        assert!(project_points(&snap, &Camera::overview(root(), 0.0), area()).is_empty());
         let empty = SceneStore::new().snapshot();
-        assert!(project_points(&empty, &Camera::overview("root", 1.0), area()).is_empty());
+        assert!(project_points(&empty, &Camera::overview(root(), 1.0), area()).is_empty());
     }
 
     /// Records the points handed to a renderer, so we can check what `SpaceView` projected.
@@ -385,12 +406,12 @@ mod tests {
     fn space_view_projects_snapshot_to_the_renderer() {
         let mut store = SceneStore::new();
         let mut tx = store.writer("p").begin(Epoch::from_seconds(0.0));
-        tx.frame("root", None, BodyState::default())
-            .object("origin", "root", at(0.0, 0.0), ObjectMeta::default())
-            .object("right", "root", at(4.0, 0.0), ObjectMeta::default());
+        tx.frame(root(), None, BodyState::default())
+            .object("origin", root(), at(0.0, 0.0), ObjectMeta::default())
+            .object("right", root(), at(4.0, 0.0), ObjectMeta::default());
         tx.commit();
 
-        let cam = Camera::overview("root", 2.0);
+        let cam = Camera::overview(root(), 2.0);
         let recorder = Recorder::default();
         let a = area();
         let mut buf = Buffer::empty(a);

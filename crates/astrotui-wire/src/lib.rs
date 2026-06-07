@@ -1,6 +1,16 @@
-//! astrotui-wire — the self-describing scene wire codec.
+//! astrotui-wire — the scene wire adapter.
 //!
-//! One codec for the socket stream (live sim / telemetry) and replay files: a scene
-//! header (FrameTree topology + object metadata) followed by frame-tagged samples
-//! (see `docs/DESIGN.md` §4.3). Codec lands in P1 (#21); JSON first, binary framing in
-//! P3 (#36). This is the only crate that enables `serde`.
+//! Consumes astrodyn's `astrodyn_frame_doc` schema (astrodyn #659) — `FrameDocument`
+//! snapshots and `FrameSeries` replay — into the core `SceneStore` via the
+//! [`Producer`](astrotui_core::producer::Producer) seam, honoring the keyframe handshake
+//! (the header is validated before any state is interpreted; see `docs/DESIGN.md` §4.3).
+//! The frame wire is `astrodyn_frame_doc`; this crate adds the outer framing and (later) the
+//! object/scene layer that rides alongside (frame_doc is frames-only). This is the only crate
+//! that depends on `astrodyn_frame_doc` (and thus its serde-based JSON surface). `serde`
+//! itself may still appear transitively elsewhere — `astrodyn_frame_doc` enables
+//! `astrodyn_quantities/serde`, and Cargo feature unification can carry that into other crates
+//! — but `astrotui-core` declares no serde/frame_doc dependency and writes no serde derives.
+
+pub mod frame_doc;
+
+pub use frame_doc::{apply_document, apply_series_epoch, ApplyError, DocumentProducer};

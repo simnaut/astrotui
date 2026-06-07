@@ -794,6 +794,23 @@ mod tests {
     }
 
     #[test]
+    fn view_basis_gimbal_guard_uses_y_alternate_when_forward_along_x() {
+        // forward ∥ +X (and up ∥ forward) takes the `f.x.abs() >= 0.9` branch → alternate up Y.
+        let cam = Camera {
+            up: UpHint::Direction(DVec3::X),
+            ..Camera::overview(root(), 1.0)
+        };
+        let b = cam.view_basis(DVec3::X); // forward == up == +X
+        assert!(approx(b.forward, DVec3::X));
+        assert!(approx(b.right, DVec3::Z)); // X × Y = Z
+        assert!(approx(b.up, DVec3::Y));
+        for v in [b.right, b.up, b.forward] {
+            assert!((v.length() - 1.0).abs() < 1e-12);
+        }
+        assert!(approx(b.right.cross(b.up), -b.forward)); // right-handed
+    }
+
+    #[test]
     fn view_basis_zero_forward_falls_back_to_minus_z() {
         let cam = Camera {
             up: UpHint::Direction(DVec3::Y),

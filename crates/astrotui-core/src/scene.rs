@@ -238,8 +238,9 @@ struct Inner {
 impl Inner {
     /// Rebuild the union snapshot from all layers. Caller holds the `layers` lock.
     ///
-    /// Producers own disjoint id sets (DESIGN.md §4.1); if two layers nonetheless declare
-    /// the same id, the layer later in `LayerId` order wins, deterministically.
+    /// Producers own disjoint identity sets (DESIGN.md §4.1); if two layers nonetheless
+    /// declare the same frame `FrameUid` or object `ObjectId`, the layer later in `LayerId`
+    /// order wins, deterministically.
     fn rebuild(layers: &BTreeMap<LayerId, Layer>) -> Snapshot {
         let mut frames: HashMap<FrameUid, FrameRecord> = HashMap::new();
         let mut objects: BTreeMap<ObjectId, SceneObject> = BTreeMap::new();
@@ -256,10 +257,11 @@ impl Inner {
             }
         }
         // `FrameUid` isn't `Ord`, so sort the union by its `Display` for a deterministic
-        // frame order (golden frames, stable diagnostics). Object order is `ObjectId`-sorted
-        // by the `BTreeMap`.
+        // frame order (golden frames, stable diagnostics). `sort_by_cached_key` computes
+        // each key once per element, not once per comparison. Object order is
+        // `ObjectId`-sorted by the `BTreeMap`.
         let mut frames: Vec<FrameRecord> = frames.into_values().collect();
-        frames.sort_by(|a, b| a.uid.to_string().cmp(&b.uid.to_string()));
+        frames.sort_by_cached_key(|r| r.uid.to_string());
         Snapshot {
             frames,
             objects: objects.into_values().collect(),

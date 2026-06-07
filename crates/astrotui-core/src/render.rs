@@ -20,7 +20,10 @@
 use std::collections::HashMap;
 
 use astrodyn_frames::{FrameTree, RefFrameRot, RefFrameState, RefFrameTrans};
-use astrodyn_quantities::{FrameUid, JeodQuat};
+use astrodyn_quantities::{
+    BodyFrame, FrameUid, JeodQuat, Lvlh, Ned, Planet, PlanetFixed, PlanetInertial, RootInertial,
+    Vehicle,
+};
 use glam::{DMat3, DVec3};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -28,26 +31,182 @@ use ratatui::widgets::StatefulWidget;
 
 use crate::scene::{BodyState, ObjectId, SceneStore, Snapshot};
 
-/// The eye. In this skeleton it is a scene frame to sit in plus an orthographic scale; the
-/// full `Camera` (target, log-zoom, up, fov — DESIGN.md §4.4) lands with the camera presets
-/// and seamless zoom in P1.
+/// Where the camera looks — resolved per render into a forward view axis in the camera frame's
+/// own coordinates (DESIGN.md §4.4). The frame sets origin + orientation; the *target* sets the
+/// view axis the eye dollies along (log-zoom is #18; angular-size LOD is #19).
+#[derive(Clone, Debug, PartialEq)]
+pub enum CameraTarget {
+    /// Look at the origin of a frame, named by [`FrameUid`] (the classic "view that frame").
+    FrameOrigin(FrameUid),
+    /// Track a scene object by id; the view axis is recomputed from its position each frame.
+    Object(ObjectId),
+    /// A fixed bearing — a direction in the camera frame's own coordinates (need not be unit;
+    /// normalized on use). Independent of scene contents.
+    Bearing(DVec3),
+}
+
+impl CameraTarget {
+    /// The forward view-axis (unit, camera-frame coordinates), or `None` if it can't be formed.
+    /// `Bearing` resolves itself; `FrameOrigin`/`Object` resolve from `look_at_cam` — the
+    /// target's position in camera coordinates, which the render pass computes from the
+    /// `FrameTree` (#18) and supplies here. A `None`/zero point or zero bearing yields `None`
+    /// (a degenerate look axis — e.g. the target coincides with the eye), surfaced by the
+    /// caller, never silently pointed somewhere arbitrary.
+    #[must_use]
+    pub fn forward(&self, look_at_cam: Option<DVec3>) -> Option<DVec3> {
+        match self {
+            CameraTarget::Bearing(dir) => dir.try_normalize(),
+            CameraTarget::FrameOrigin(_) | CameraTarget::Object(_) => {
+                look_at_cam.and_then(DVec3::try_normalize)
+            }
+        }
+    }
+}
+
+/// The camera's "which way is up" reference, in the camera frame's coordinates. Combined with
+/// the view axis to build an orthonormal [`ViewBasis`]; the basis is **gimbal-guarded** for the
+/// degenerate case where up is parallel to the view axis (see [`Camera::view_basis`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum UpHint {
+    /// The camera frame's +Z axis — the sensible default for most frames.
+    FrameUp,
+    /// An explicit up direction in camera-frame coordinates (normalized on use).
+    Direction(DVec3),
+}
+
+impl UpHint {
+    /// The (un-normalized) up direction in camera-frame coordinates.
+    fn vector(&self) -> DVec3 {
+        match self {
+            UpHint::FrameUp => DVec3::Z,
+            UpHint::Direction(v) => *v,
+        }
+    }
+}
+
+/// A right-handed orthonormal camera basis, in the camera frame's coordinates: the eye looks
+/// along `forward`, `right` is screen-right, `up` is screen-up. `right × up == -forward` — the
+/// eye looks down its own −Z, matching [`project_orthographic`]'s screen convention, so the
+/// projection and the basis agree once #18 wires the view transform in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewBasis {
+    /// Screen-right (unit).
+    pub right: DVec3,
+    /// Screen-up (unit).
+    pub up: DVec3,
+    /// The view axis the eye looks along (unit).
+    pub forward: DVec3,
+}
+
+/// Squared length below which the `forward × up` cross product is treated as a gimbal-lock
+/// degeneracy. Inputs are unit, so this is `sin²θ` between them — ~0.057° of separation.
+const GIMBAL_EPS_SQ: f64 = 1e-6;
+
+/// Build a right-handed orthonormal [`ViewBasis`] from a view axis + up hint, **gimbal-guarded**.
+/// `forward` need not be unit; a (near-)zero `forward` falls back to the frame's −Z look axis,
+/// and an up hint (near-)parallel to `forward` falls back to an alternate axis — so the result
+/// is always orthonormal and finite.
+fn orthonormal_view(forward: DVec3, up_hint: DVec3) -> ViewBasis {
+    let f = forward.try_normalize().unwrap_or(DVec3::NEG_Z);
+    let up0 = up_hint.try_normalize().unwrap_or(DVec3::Z);
+    // right = forward × up (with f = −Z, up = +Y this is +X = screen-right).
+    let mut right = f.cross(up0);
+    if right.length_squared() < GIMBAL_EPS_SQ {
+        // up ∥ forward (gimbal lock): pick an alternate up least aligned with the view axis.
+        let alt = if f.x.abs() < 0.9 { DVec3::X } else { DVec3::Y };
+        right = f.cross(alt);
+    }
+    let right = right.normalize();
+    let up = right.cross(f); // re-orthogonalized; unit since right ⟂ f and both are unit.
+    ViewBasis {
+        right,
+        up,
+        forward: f,
+    }
+}
+
+/// The eye. A scene frame to sit in (astrodyn #659 identity), a [`CameraTarget`] view axis, an
+/// [`UpHint`], and an orthographic scale. Seamless **log-zoom** replaces the raw `scale` in #18
+/// and angular-size **LOD** arrives in #19; the frame/target/up model here is the stable base
+/// they build on (DESIGN.md §3 preset table, §4.4).
 #[derive(Clone, Debug)]
 pub struct Camera {
     /// Identity of the scene frame the eye sits in / is oriented by (astrodyn #659).
     pub frame: FrameUid,
-    /// Orthographic scale: metres per terminal cell. Replaced by log-zoom in P1.
+    /// What the eye looks at — the view axis.
+    pub target: CameraTarget,
+    /// Which way is up when building the view basis.
+    pub up: UpHint,
+    /// Orthographic scale: metres per terminal cell. Replaced by log-zoom in #18.
     pub scale: f64,
 }
 
 impl Camera {
     /// A scene overview anchored in the frame named by `frame` (e.g.
-    /// `FrameUid::of::<RootInertial>()`), at `metres_per_cell` orthographic scale.
+    /// `FrameUid::of::<RootInertial>()`), looking at that frame's origin with frame-up, at
+    /// `metres_per_cell` orthographic scale. The general-frame form of [`Camera::solar_overview`].
     #[must_use]
     pub fn overview(frame: FrameUid, metres_per_cell: f64) -> Self {
+        Self::in_frame(frame, metres_per_cell)
+    }
+
+    /// Common preset body: sit in `frame`, look at its origin, frame-up, orthographic `scale`.
+    fn in_frame(frame: FrameUid, scale: f64) -> Self {
         Self {
+            target: CameraTarget::FrameOrigin(frame.clone()),
             frame,
-            scale: metres_per_cell,
+            up: UpHint::FrameUp,
+            scale,
         }
+    }
+
+    /// **Solar-system overview** — the inertial root (`RootInertial`). Earth→Jupiter cruise.
+    #[must_use]
+    pub fn solar_overview(scale: f64) -> Self {
+        Self::in_frame(FrameUid::of::<RootInertial>(), scale)
+    }
+
+    /// **Inertial chase** — a planet's non-rotating inertial frame (`PlanetInertial<P>`). Orbits.
+    #[must_use]
+    pub fn inertial_chase<P: Planet>(scale: f64) -> Self {
+        Self::in_frame(FrameUid::of::<PlanetInertial<P>>(), scale)
+    }
+
+    /// **Body-fixed** — a planet's rotating body-fixed frame (`PlanetFixed<P>`). Ground track,
+    /// lunar approach.
+    #[must_use]
+    pub fn body_fixed<P: Planet>(scale: f64) -> Self {
+        Self::in_frame(FrameUid::of::<PlanetFixed<P>>(), scale)
+    }
+
+    /// **Orbit-relative** — a chief vehicle's LVLH frame (`Lvlh<V>`). Nadir / ram-pointed.
+    #[must_use]
+    pub fn orbit_relative<V: Vehicle>(scale: f64) -> Self {
+        Self::in_frame(FrameUid::of::<Lvlh<V>>(), scale)
+    }
+
+    /// **Vehicle local NED** — a moving vehicle's north-east-down frame (`Ned<V>`).
+    #[must_use]
+    pub fn vehicle_ned<V: Vehicle>(scale: f64) -> Self {
+        Self::in_frame(FrameUid::of::<Ned<V>>(), scale)
+    }
+
+    /// **Onboard** — a vehicle's body frame (`BodyFrame<V>`). Cockpit / sensor boresight.
+    #[must_use]
+    pub fn onboard<V: Vehicle>(scale: f64) -> Self {
+        Self::in_frame(FrameUid::of::<BodyFrame<V>>(), scale)
+    }
+
+    // NOTE: the **local-horizon** preset over `Topocentric<P>` is intentionally absent — it is
+    // paused on astrodyn simnaut/astrodyn#688. `FrameUid::of::<Topocentric<P>>()` is keyed by
+    // planet only, so every ground site on a planet collides on one identity; we wait for typed
+    // multi-site identity rather than ship a single-site stopgap. Add it once #688 lands.
+
+    /// Build the orthonormal [`ViewBasis`] for a resolved `forward` view axis (in camera-frame
+    /// coordinates), applying this camera's [`UpHint`]. Gimbal-guarded — see [`orthonormal_view`].
+    #[must_use]
+    pub fn view_basis(&self, forward: DVec3) -> ViewBasis {
+        orthonormal_view(forward, self.up.vector())
     }
 }
 
@@ -526,6 +685,163 @@ mod tests {
         fn draw_points(&self, points: &[(f64, f64)], _area: Rect, _buf: &mut Buffer) {
             self.0.borrow_mut().extend_from_slice(points);
         }
+    }
+
+    // A throwaway Vehicle marker for the vehicle-parameterized presets (Lvlh/Ned/BodyFrame).
+    astrodyn_quantities::define_vehicle!(TestProbe);
+
+    fn approx(a: DVec3, b: DVec3) -> bool {
+        a.abs_diff_eq(b, 1e-12)
+    }
+
+    #[test]
+    fn presets_name_the_expected_frames_with_default_target_and_up() {
+        use astrodyn_quantities::{BodyFrame, Lvlh, Ned, PlanetInertial};
+        let cases = [
+            (Camera::solar_overview(1.0), FrameUid::of::<RootInertial>()),
+            (
+                Camera::inertial_chase::<Moon>(1.0),
+                FrameUid::of::<PlanetInertial<Moon>>(),
+            ),
+            (
+                Camera::body_fixed::<Moon>(1.0),
+                FrameUid::of::<PlanetFixed<Moon>>(),
+            ),
+            (
+                Camera::orbit_relative::<TestProbe>(1.0),
+                FrameUid::of::<Lvlh<TestProbe>>(),
+            ),
+            (
+                Camera::vehicle_ned::<TestProbe>(1.0),
+                FrameUid::of::<Ned<TestProbe>>(),
+            ),
+            (
+                Camera::onboard::<TestProbe>(1.0),
+                FrameUid::of::<BodyFrame<TestProbe>>(),
+            ),
+        ];
+        for (cam, uid) in cases {
+            assert_eq!(cam.frame, uid, "preset frame uid");
+            // Default target is the camera's own frame origin; default up is frame-up.
+            assert_eq!(cam.target, CameraTarget::FrameOrigin(uid));
+            assert_eq!(cam.up, UpHint::FrameUp);
+        }
+        // Distinct planets / vehicles yield distinct identities (tag carries the parameter).
+        assert_ne!(
+            Camera::body_fixed::<Moon>(1.0).frame,
+            Camera::body_fixed::<Mars>(1.0).frame
+        );
+    }
+
+    #[test]
+    fn view_basis_matches_projection_convention() {
+        // Eye looks down −Z with +Y up → +X right, +Y up — the axes project_orthographic
+        // assumes (the view transform that consumes this lands in #18).
+        let cam = Camera {
+            up: UpHint::Direction(DVec3::Y),
+            ..Camera::overview(root(), 1.0)
+        };
+        let b = cam.view_basis(DVec3::NEG_Z);
+        assert!(approx(b.forward, DVec3::NEG_Z));
+        assert!(approx(b.right, DVec3::X));
+        assert!(approx(b.up, DVec3::Y));
+        // Right-handed with the eye down its own −Z: right × up == −forward.
+        assert!(approx(b.right.cross(b.up), -b.forward));
+    }
+
+    #[test]
+    fn default_frame_up_is_z_so_top_down_is_the_gimbal_case() {
+        // The default up is the frame's +Z; looking straight down (−Z) is then up ∥ forward —
+        // a genuine top-down ambiguity. The guard must still yield an orthonormal basis.
+        let b = Camera::overview(root(), 1.0).view_basis(DVec3::NEG_Z);
+        assert_eq!(Camera::overview(root(), 1.0).up, UpHint::FrameUp);
+        assert!(approx(b.forward, DVec3::NEG_Z));
+        for v in [b.right, b.up, b.forward] {
+            assert!((v.length() - 1.0).abs() < 1e-12);
+        }
+        assert!(b.right.dot(b.forward).abs() < 1e-12);
+        assert!(approx(b.right.cross(b.up), -b.forward));
+    }
+
+    #[test]
+    fn view_basis_is_orthonormal_for_an_oblique_axis() {
+        let cam = Camera {
+            up: UpHint::Direction(DVec3::new(0.0, 1.0, 0.2)),
+            ..Camera::overview(root(), 1.0)
+        };
+        let b = cam.view_basis(DVec3::new(1.0, 2.0, -3.0));
+        for v in [b.right, b.up, b.forward] {
+            assert!((v.length() - 1.0).abs() < 1e-12, "unit length");
+        }
+        assert!(b.right.dot(b.up).abs() < 1e-12);
+        assert!(b.right.dot(b.forward).abs() < 1e-12);
+        assert!(b.up.dot(b.forward).abs() < 1e-12);
+        assert!(approx(b.right.cross(b.up), -b.forward)); // right-handed
+    }
+
+    #[test]
+    fn view_basis_gimbal_guard_when_up_parallel_to_forward() {
+        // up ∥ forward would collapse the basis; the guard must still return an orthonormal one.
+        let cam = Camera {
+            up: UpHint::Direction(DVec3::Z),
+            ..Camera::overview(root(), 1.0)
+        };
+        let b = cam.view_basis(DVec3::Z); // forward == up
+        assert!(approx(b.forward, DVec3::Z));
+        assert!((b.right.length() - 1.0).abs() < 1e-12);
+        assert!(b.right.dot(b.forward).abs() < 1e-12, "right ⟂ forward");
+        assert!(approx(b.right.cross(b.up), -b.forward)); // still right-handed
+    }
+
+    #[test]
+    fn view_basis_gimbal_guard_uses_y_alternate_when_forward_along_x() {
+        // forward ∥ +X (and up ∥ forward) takes the `f.x.abs() >= 0.9` branch → alternate up Y.
+        let cam = Camera {
+            up: UpHint::Direction(DVec3::X),
+            ..Camera::overview(root(), 1.0)
+        };
+        let b = cam.view_basis(DVec3::X); // forward == up == +X
+        assert!(approx(b.forward, DVec3::X));
+        assert!(approx(b.right, DVec3::Z)); // X × Y = Z
+        assert!(approx(b.up, DVec3::Y));
+        for v in [b.right, b.up, b.forward] {
+            assert!((v.length() - 1.0).abs() < 1e-12);
+        }
+        assert!(approx(b.right.cross(b.up), -b.forward)); // right-handed
+    }
+
+    #[test]
+    fn view_basis_zero_forward_falls_back_to_minus_z() {
+        let cam = Camera {
+            up: UpHint::Direction(DVec3::Y),
+            ..Camera::overview(root(), 1.0)
+        };
+        let b = cam.view_basis(DVec3::ZERO);
+        assert!(approx(b.forward, DVec3::NEG_Z)); // degenerate axis → frame look axis
+        assert!(approx(b.right, DVec3::X));
+        assert!(approx(b.up, DVec3::Y));
+    }
+
+    #[test]
+    fn camera_target_forward_resolution() {
+        // Bearing resolves itself (normalized), ignoring the supplied point.
+        let bearing = CameraTarget::Bearing(DVec3::new(0.0, 0.0, -5.0));
+        assert_eq!(bearing.forward(None), Some(DVec3::NEG_Z));
+        // FrameOrigin / Object resolve from the look-at point in camera coords.
+        let origin = CameraTarget::FrameOrigin(child());
+        assert_eq!(
+            origin.forward(Some(DVec3::new(0.0, 10.0, 0.0))),
+            Some(DVec3::Y)
+        );
+        let tracked = CameraTarget::Object("probe".into());
+        assert_eq!(
+            tracked.forward(Some(DVec3::new(3.0, 0.0, 0.0))),
+            Some(DVec3::X)
+        );
+        // Degenerate look axes (no point, or target coincident with the eye) yield None.
+        assert_eq!(origin.forward(None), None);
+        assert_eq!(tracked.forward(Some(DVec3::ZERO)), None);
+        assert_eq!(CameraTarget::Bearing(DVec3::ZERO).forward(None), None);
     }
 
     #[test]

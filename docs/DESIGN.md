@@ -56,9 +56,10 @@ appear only in *producers* that live outside astrotui (§4).
 |---|---|---|
 | Frame tree + relative state | `astrodyn_frames`: `FrameTree`, `compute_relative_state(from, to) -> RefFrameState`; typed `orchestration::compute_relative_state_typed::<From, To>()` | **core** (render pass) |
 | Typed frames | `astrodyn_quantities::frame`: `RootInertial`, `PlanetInertial<P>`, `PlanetFixed<P>`, `Ecef`, `BodyFrame<V>`, `Lvlh<C>`, `Ned<C>`, `Topocentric<P>`; planets `Earth/Moon/Sun/Mars`; `define_planet!`/`define_vehicle!` | **core** + producers |
+| Runtime frame identity *(astrodyn #659)* | `astrodyn_quantities::frame_descriptor`: `FrameUid { namespace, class, role, tag }`, `Frame::DESCRIPTOR`, `FrameUid::of::<F>()` / `is::<F>()` / `external(…)` | **core** (type, no serde) + wire + producers |
 | Typed quantities | `Position<F>` / `Velocity<F>` = `Qty3<D, F>` (`#[repr(C)]` over 3×f64), `raw_si() -> DVec3`, `from_raw_si()`, `zero()` | **core** + wire |
 | Rotations | `NormalizedQuat<ScalarFirst, LeftTransform>` (JEOD convention), `FrameTransform<From, To>` (`.apply()`, `.matrix()`, `.inverse()`, `Mul` composition) | **core** |
-| State + epoch wire format | `astrodyn_quantities::CartesianState<F>` = `{ position, velocity, epoch: SecondsSince<TDB> }`, serde behind the crate's non-default `serde` feature | **wire** |
+| Frame wire format *(astrodyn #659)* | `astrodyn_frame_doc`: `FrameDocument` (snapshot) + `FrameSeries` (replay) and their record types — `DocHeader`/`Conventions`/`FrameRecord`/`EpochRow`/`CanonicalRotation`/`Origin` (bit-exact, serde; deps = `astrodyn_quantities` + serde only, never the physics crates) | **wire** (frames) |
 | Body shape | `astrodyn_planet::PlanetShape { mu, r_eq, r_pol, flat_coeff }`; presets `EARTH/MOON/SUN/MARS/JUPITER/SATURN` | **core** (LOD/ellipsoid/DEM) |
 | Body positions *(producer only)* | `astrodyn_ephemeris`: `Ephemeris::get_state_typed(target, observer, tdb) -> (Position<RootInertial>, Velocity<RootInertial>)` (DE421/DE440 via ANISE) | ephemeris body-filler (orchestrator-side) |
 | Body-fixed orientation *(producer only)* | `Ephemeris::get_body_rotation_to::<P>(body, BodyFixedFrame, epoch) -> FrameTransform<RootInertial, PlanetFixed<P>>` (`Iau`, `MoonPaDe421`, `MoonMeDe421`) | sim exporter / body-filler |
@@ -85,8 +86,9 @@ collapses to **one astrodyn call** — *evaluate relative state against the came
 frame*:
 
 ```rust
-// Where is `obj` as seen from the camera's frame? FrameIds are RUNTIME values.
-let s = compute_relative_state(&tree, cam.frame, obj.frame);  // dynamic, by FrameId
+// Where is `obj` as seen from the camera's frame? Frames are named by FrameUid;
+// the tree resolves each to a node, then composes the relative state.
+let s = compute_relative_state(&tree, cam.frame, obj.frame);  // by resolved node
 let pos_cam: DVec3 = s.trans.position.raw_si();   // metres, in camera coordinates
 let vel_cam: DVec3 = s.trans.velocity.raw_si();   // m/s   -> leading indicators / HUD
 let att_cam: DMat3 = s.rot.t_parent_this();        // object body axes, in camera frame
@@ -103,48 +105,42 @@ back in the **camera's own coordinates**. Therefore:
   lander", "watch from the orbit-relative frame") maps 1:1 onto astrodyn's
   *existing* frame markers.
 
-> **Closed `FrameKind` by default; dynamic only for the open tail** *(revised
-> 2026-06-04 — supersedes the earlier "dynamic, not typed on the hot path"
-> stance).* Core classifies every frame into a **closed enum** with a string
-> escape hatch:
+> **Identity is `astrodyn_quantities::FrameUid`** *(revised 2026-06-07 — adopts
+> astrodyn [#659](https://github.com/simnaut/astrodyn/issues/659); supersedes the
+> 2026-06-04 home-grown `FrameKind` enum + `Other(String)` plan, which is no longer
+> built).* astrodyn now ships a first-class runtime frame identity; astrotui
+> **consumes it** rather than reinventing one:
 >
 > ```rust
-> enum FrameKind {
->     RootInertial,
->     PlanetInertial(PlanetId),
->     PlanetFixed(PlanetId),
->     Topocentric(SiteId),
->     BodyFrame(VehicleId),
->     // … the frames core actually supports …
->     Other(String),               // the genuine producer-invented tail
-> }
+> // astrodyn_quantities::frame_descriptor
+> struct FrameUid { namespace: Namespace, class: FrameClass, role: FrameRole, tag: Tag }
 > ```
 >
-> The common, dangerous frames — especially the *oriented* ones — are therefore
-> type-checked **by category** in core; only genuinely producer-invented frames
-> land in `Other(String)` and stay stringly-resolved. This recovers the
-> compile-time net where orientation bugs actually live, while staying
-> source-agnostic at the edges. (The firewall does **not** force erasure —
-> `astrodyn_quantities::frame`'s markers are pure and already a core dep; only the
-> *open tail* does, so a scalpel beats the sledgehammer.)
+> This *is* the "closed vocabulary + escape hatch" we were going to hand-roll, done
+> upstream and better:
+> - **Closed vocabulary**: `FrameClass` × `FrameRole` cover the supported frames.
+> - **Escape hatch**: `FrameRole::Custom` + `FrameUid::external(non-LOCAL namespace …)`
+>   represent producer-invented frames with **no `impl Frame`** required — the
+>   runtime-only tail, namespaced so it can't collide with astrodyn identities.
+> - **Category *and* identity**: `tag` carries the parameter (e.g. `PlanetFixed`
+>   with `tag = Moon`), so the earlier "category-not-identity" ceiling is gone —
+>   `FrameUid` distinguishes Moon-fixed from Mars-fixed, not just "a planet-fixed".
+> - **Typed ⇄ runtime bridge**: every sealed marker carries `Frame::DESCRIPTOR`, so
+>   `FrameUid::of::<F>()` lowers a compile-time frame to its uid and
+>   `uid.is::<F>()` recovers/checks it — lossless, at fixed compile-time sites.
 >
 > Two boundaries to keep straight:
-> - **Category, not identity.** `PlanetFixed(PlanetId)` distinguishes a body-fixed
->   frame from a topocentric one *by category*; *which* planet stays a runtime
->   `PlanetId`, because astrodyn's `PlanetFixed<P>` is compile-time-generic and core
->   can't know the planet for an arbitrary producer. The fully-typed markers
->   (`PlanetFixed<Moon>`) are used only at **fixed compile-time sites** — a
->   hardcoded camera preset, the orientation proof test (§4.4).
-> - **Render still resolves by node.** Geometry is still evaluated via
->   `compute_relative_state(from, to)` over a `FrameTree` rebuilt per render;
->   `FrameKind` governs *classification, the typed bridge, and diagnostics*, not the
->   per-vertex math. `compute_relative_state_typed::<From, To>()` is used at the
->   fixed-site cases. Objects and the camera still name their frame by its
->   **`FrameId` handle**; `FrameKind` is a property *of that node* (it sits on the
->   `FrameRecord`, §4.2), never a substitute for the handle that resolution and
->   dangling-detection need.
+> - **Core holds `FrameUid` without serde.** The type lives in `astrodyn_quantities`
+>   (already a core dep); its `serde` derives are feature-gated and needed only by
+>   the wire crate, so `astrotui-core` adopts `FrameUid` as its identity and stays
+>   serde-free. The firewall is untouched (`astrodyn_quantities` is Bevy/ANISE-free).
+> - **Render resolves by node.** Geometry is still evaluated via
+>   `compute_relative_state(from, to)` over a `FrameTree`; `FrameUid` is the stable
+>   *identity/handle* objects and the camera name their frame by, and the tree
+>   resolves a uid to a node (`FrameTree::resolve(&uid)`, with a loud miss). Identity
+>   is never a substitute for the node the per-vertex math walks.
 
-Camera presets — each is just a `FrameId` the camera sits in:
+Camera presets — each is just a `FrameUid` the camera sits in:
 
 | Preset | astrodyn frame | Scenario |
 |---|---|---|
@@ -280,16 +276,15 @@ flowchart LR
   U --> R["SpaceView render"]
 ```
 
-> **In-process `Producer` first; wire/streaming deferred** *(revised 2026-06-04).*
-> The seam producers actually plug into is an in-process trait —
+> **In-process `Producer` first; the frame wire is `astrodyn_frame_doc`** *(revised
+> 2026-06-07).* The seam producers plug into is an in-process trait —
 > `trait Producer { fn populate(&self, w: &mut SceneWriter); }` — and the
-> orchestrator demo's body placement is its first impl. The self-describing **wire
-> codec and the multi-process streaming/reader machinery (§4.3) are deferred**
-> until a real second producer exists to pin their shape; building them now would
-> freeze the most consequential contract against P3 guesses. `SceneWriter` /
-> layers / snapshot are the durable seam; the transport is built when needed. (The
-> multi-process picture in §4's diagram remains the *eventual* P3 architecture —
-> this defers *when* it's built, not *whether*.)
+> orchestrator demo's body placement is its first impl. The frame wire is **no
+> longer home-grown**: a streaming `Producer` consumes `astrodyn_frame_doc` record
+> types off a socket (§4.3), honoring its keyframe handshake. Building the socket
+> transport waits for a real second producer; `SceneWriter` / layers / snapshot are
+> the durable seam. (The multi-process picture in §4's diagram remains the
+> *eventual* P3 architecture — this defers *when* it's built, not *whether*.)
 
 ### 4.2 The scene data model
 
@@ -307,7 +302,7 @@ producer is slow or bursty.
 pub struct SceneObject {
     pub id:    ObjectId,
     pub label: Cow<'static, str>,        // shown in the camera/frame switcher UI
-    pub frame: FrameId,                  // handle to the FrameTree node this object lives in
+    pub frame: FrameUid,                 // identity of the FrameTree node this object lives in (astrodyn #659)
     pub kind:  ObjectKind,               // Body | Spacecraft | Site | Marker
     pub shape: Option<BodyShape>,        // astrodyn_planet::PlanetShape (+ optional DEM handle)
     pub trail: TrailRef,                 // plugin-PROVIDED ring buffer, PRODUCER-populated
@@ -319,22 +314,21 @@ Frames and objects carry **stable ids + human labels + kind**, so the host's
 camera UI can enumerate `scene.frames()` / `scene.objects()` and let the user
 target any of them (the in-TUI frame/camera switcher, §10/P4).
 
-**`FrameKind` lives on the frame node, not the object reference.** An object (and
-the camera) names its frame by its `FrameId` **handle** — that handle is what
-`compute_relative_state` resolves against and what the §4.4 "unresolved frame"
-check tests for. Each `FrameTree` node *also* carries a `FrameKind` classification,
-assigned at ingest from the producer-declared kind (recognized → typed category;
-otherwise `Other(declared_kind)`). So the two are orthogonal and both present:
-`FrameId` = node identity (resolution, dangling-detection); `FrameKind` = that
-node's classification (the typed bridge and diagnostics of §3) — never a
-replacement for the handle.
+**`FrameUid` is both the handle and the classification.** An object (and the
+camera) names its frame by its `FrameUid` — the `FrameTree` resolves a uid to a
+node (`resolve(&uid)`, loud on miss, §4.4), so the uid is what binds objects to
+frames and what dangling-detection tests. Because `FrameUid` carries
+`class`/`role`/`tag` intrinsically (§3), there is **no separate `kind` field** —
+identity and classification are one value. Core's `FrameRecord` is the in-memory
+dual of `astrodyn_frame_doc`'s wire record (§4.3), with uid-table indices resolved
+to `FrameUid`s and the frame's state held natively:
 
 ```rust
 pub struct FrameRecord {
-    pub id:     FrameId,            // stable node handle (what objects + camera point at)
-    pub parent: Option<FrameId>,   // None == root
-    pub kind:   FrameKind,          // classification (§3); Other(String) for the open tail
-    pub state:  BodyState,          // state relative to parent
+    pub uid:    FrameUid,           // identity (carries class/role/tag); astrodyn #659
+    pub parent: Option<FrameUid>,  // None == root
+    pub epoch:  Option<Epoch>,     // per-frame time-validity (astrodyn_frame_doc RFS-603)
+    pub state:  BodyState,         // trans + canonical rotation + ang-vel, relative to parent
 }
 ```
 
@@ -345,57 +339,55 @@ sees a consistent prefix without copying the buffer.
 
 ### 4.3 The wire format — one self-describing stream
 
-> **Status: specified, not yet built** *(revised 2026-06-04).* The shape below is
-> the frozen paper spec; the codec and readers are **deferred** behind the
-> in-process `Producer` trait (§4.1) until producer #2 pins their real shape. When
-> built, a wire frame's `kind` string is **classified into `FrameKind`** (§3) on
-> ingest — recognized → typed category, unrecognized → `Other(String)`. That
-> classify step *is* the type-erasure boundary, and the point the §4.4 proof test
-> exercises (with byte-encoding stubbed).
+The **frame** wire is **`astrodyn_frame_doc`** *(astrodyn #659 — supersedes the
+home-grown self-describing codec previously specified here).* astrodyn ships a
+physics-free schema crate (deps = `astrodyn_quantities` + serde only) whose record
+types are the supported public surface; astrotui consumes them directly. The same
+types serve socket, telemetry, and replay:
 
-The serialized form is what crosses the socket from a spawned sim, arrives from
-real ops, *and* sits in a replay file — **one codec** (`astrotui-wire`), so all
-three are the same reader. It is **self-describing**: a header record carries the
-frame topology + object metadata, then frame-tagged sample records stream:
+- **Snapshot** = `FrameDocument { header, uids, records }`.
+- **Replay** = `FrameSeries { header, uids, segments → EpochRow → records }`.
+- **Identity** is interned: a `FrameRecord` names its frame and parent by `u32`
+  index into the document's `Vec<FrameUid>`; each record also carries `epoch`,
+  `TransRecord`, `CanonicalRotation` (quat **or** matrix, whichever was canonical
+  at the write site — bit-exact), `ang_vel`, and an `Origin` (integrated / derived
+  / injected). `DocHeader` carries `schema_version` + in-band `Conventions`.
 
-```jsonc
-// header (once, on connect / at start of file):
-{ "type": "scene",
-  "frames":  [ { "id": "moon_fixed", "parent": "moon_inertial",
-                 "kind": "PlanetFixed<Moon>", "label": "Moon (ME)" }, … ],
-  "objects": [ { "id": "lander", "frame": "moon_fixed",
-                 "kind": "Spacecraft", "label": "LM", "shape": null }, … ] }
+**Live-feed handshake** (the contract astrodyn specified for streaming the record
+types over a socket, rather than loading a whole-document JSON blob):
 
-// samples (streamed thereafter):
-{ "type": "sample", "epoch": 12345.6,
-  "frames":  [ { "id": "moon_fixed", "rel_state": { "position": [x,y,z],
-                                                    "velocity": [x,y,z],
-                                                    "rot": [w,x,y,z] } } ],
-  "objects": [ { "id": "lander", "position": [x,y,z], "velocity": [x,y,z] } ] }
-```
+1. **Keyframe = `DocHeader` + the interned uid table, sent once.** Then stream
+   per-epoch `EpochRow`s. Use a binary serde format (e.g. postcard) for the
+   high-rate path — binary f64 is inherently bit-exact, so the JSON-only
+   `float_roundtrip` caveat doesn't apply.
+2. **Validate before interpreting any number.** Check `schema_version` +
+   `Conventions` at the handshake (the loose-row equivalents of the document's
+   `validate_header` / `validate_uid_table`, since `FrameSeries::validate`'s
+   whole-document invariants don't run on a socket stream).
+3. **Per-record `parent` is self-checking.** Verify each record's parent against
+   the folded topology; a mismatch is **loud inconsistency, never reinterpretation**
+   (§4.4) — this is the RFS-301/302 transplant guard against the stale-parent
+   ~10⁵ km failure mode.
+4. **Topology change → re-send a keyframe** (the v1 segment rule: close the
+   segment, re-send header + uid table). astrodyn's planned **v2** streaming
+   topology events (`Reparent` / `AddFrame` / `RemoveFrame`, additive under
+   `schema_version`) would make a frame switch a first-class renderable event;
+   not needed for the P2 static-topology slice, available on request.
+5. **Pin the `astrodyn_frame_doc` version on both ends and gate on
+   `schema_version`** at handshake; pre-1.0 the schema evolves additively
+   (`Origin` / `CanonicalRotation` may gain variants behind a version bump).
 
-Built on `astrodyn_quantities::CartesianState<F>` with the crate's `serde`
-feature. Because each record carries its **frame id**, a log/stream is fully
-**self-describing and replayable without the producer's code** — unlike a bare
-`CartesianState` whose frame is an out-of-band compile-time choice. Only
-`astrotui-wire` and producers enable `serde`; the render core stays serde-free.
-
-> **Encoding is not locked — JSON above is illustrative.** The shape (header +
-> frame-tagged samples) is the decision; the on-wire encoding is owned by
-> `astrotui-wire`. **Future consideration (performance):** a high-rate descent
-> feed over a socket will likely want a **binary framing** rather than JSON —
-> `CartesianState<F>` is `#[repr(C)]` over f64s and so is trivially packable, and
-> binary sidesteps per-sample float parse/format cost and text bloat. A
-> reasonable path is JSON for the header (rare, human-debuggable) + a compact
-> binary frame per sample, or a length-prefixed binary record for both. Defer the
-> choice to `astrotui-wire`; keep the codec behind an interface so the encoding
-> can change without touching producers or the render core.
+Core holds `FrameUid` without serde (§3); the serde-bearing `astrodyn_frame_doc`
+lives in the wire/adapter crate, so the render core stays serde-free. The
+**object/scene layer is astrotui's** — `astrodyn_frame_doc` models *frames only*,
+so objects (with `kind`/`shape`/`trail`/`path`) ride alongside in astrotui's own
+record, referencing frames by `FrameUid`.
 
 ### 4.4 The render pass
 
 ```rust
 pub struct Camera {
-    pub frame:  FrameId,       // the eye sits in / is oriented by this frame
+    pub frame:  FrameUid,      // the eye sits in / is oriented by this frame (astrodyn #659)
     pub target: CameraTarget,  // a frame origin, a tracked object, or a fixed bearing
     pub zoom:   LogZoom,       // log-distance dolly along the view axis
     pub up:     UpHint,
@@ -415,21 +407,22 @@ Per frame, over the latest snapshot's `FrameTree`:
 5. **LOD** on angular size → point | shaded ellipsoid | DEM mesh.
 6. **Rasterize** into the active backend's cell buffer → ratatui `Buffer`.
 
-> **Unresolved frames are loud** *(revised 2026-06-04).* An object whose frame
-> does not resolve in the snapshot's `FrameTree` is **surfaced** — a logged warning
-> plus a visible orphan marker / status line — never silently culled. A mistyped or
-> dangling frame id must not present as a blank screen. (This replaces the P0
-> skeleton's silent `else continue`.)
+> **Unresolved frames and stale parents are loud** *(revised 2026-06-07).* An
+> object or record whose frame doesn't `resolve(&uid)` in the snapshot's
+> `FrameTree`, **or** whose per-record `parent` disagrees with the folded topology
+> (§4.3), is **surfaced** — a logged warning plus a visible orphan marker / status
+> line — never silently culled or reinterpreted. This is the RFS-301/302 transplant
+> guard (a stale parent is the ~10⁵ km failure mode), and it replaces the P0
+> skeleton's silent `else continue`.
 >
-> **Orientation correctness is proven before P2.** Core stores attitude as a raw
-> `DQuat` carrying no from/to frame, so frame-mixing in rotation composition is the
-> highest-risk gap — and exactly where a string-only model gives no net. Before the
-> P2 rotating-frame work, one end-to-end test drives a typed
-> `FrameTransform<RootInertial, PlanetFixed<Moon>>` through the `Producer`/`FrameKind`
-> classify boundary (wire byte-encoding stubbed) into core's untyped rebuild, then
-> asserts both `att_cam` and `pos_cam` against a hand-computed reference. That test
-> **gates the P2 epic** and validates the "structural enforcement suffices" thesis
-> before anything is built on it.
+> **Orientation correctness is an integration test against `astrodyn_frame_doc`,
+> gating P2.** astrodyn now carries rotation as first-class data (`CanonicalRotation`,
+> bit-exact) and the runner already stamps real `PlanetFixed<…>` identities, so the
+> earlier hand-rolled typed→wire→untyped proof is unnecessary. The remaining check:
+> deserialize a `FrameDocument`/`FrameSeries` containing a rotating frame, resolve
+> it through the `FrameTree`, run `compute_relative_state`, and assert `att_cam` /
+> `pos_cam` against a hand-computed reference (plus the loud parent-mismatch path).
+> That integration test **gates the P2 epic**.
 
 ```mermaid
 flowchart LR
@@ -634,8 +627,8 @@ flowchart TD
 |---|---|
 | **P0** | `SceneStore` + scoped `SceneWriter` + snapshot/double-buffer; braille backend; `RootInertial` overview; a trivial in-process producer feeding Earth/Moon/Sun points. *Validates camera=frame + projection + ingestion.* |
 | **P1** | Camera presets + seamless log-zoom + LOD (point → shaded ellipsoid); color-cell backend. *(Wire codec + replay reader **deferred** behind the in-process `Producer` trait — §4.1.)* |
-| **Pre-P2 hardening** *(added 2026-06-04)* | Migrate core to the `FrameKind` enum + `Other(String)` tail (§3); introduce the in-process `Producer` trait (§4.1); make unresolved frames loud (§4.4); and the **end-to-end rotating-frame orientation proof test that gates P2** (§4.4). |
-| **P2** | Moon-landing slice: producer-supplied `MoonMeDe421` frame, `Topocentric<Moon>` camera, trail + path. **Blocked by the Pre-P2 orientation proof test (§4.4).** **DEM via a dedicated design doc + staged build:** (1) one static pre-tiled site → mesh → shade end-to-end, (2) dynamic tiling/paging, (3) LOD + memory budget, (4) hillshade across all backends. |
+| **Pre-P2 hardening** *(added 2026-06-04; rescoped 2026-06-07 for astrodyn #659)* | Adopt `astrodyn_quantities::FrameUid` as the core frame identity (§3); consume `astrodyn_frame_doc` record types for the frame wire (§4.3); introduce the in-process `Producer` trait (§4.1); make unresolved frames + stale parents loud (§4.4); and the **integration test consuming a rotating-frame `FrameDocument` that gates P2** (§4.4). |
+| **P2** | Moon-landing slice: producer-supplied `MoonMeDe421` frame, `Topocentric<Moon>` camera, trail + path. **Blocked by the Pre-P2 rotating-frame integration test (§4.4).** **DEM via a dedicated design doc + staged build:** (1) one static pre-tiled site → mesh → shade end-to-end, (2) dynamic tiling/paging, (3) LOD + memory budget, (4) hillshade across all backends. |
 | **P3** | Separate-process sim + exporter; orchestrator spawn/observe lifecycle; telemetry listen + ephemeris body-filler layer; backend auto-detect. |
 | **P4** | Earth→Jupiter cruise scene, HUD, in-TUI frame/camera switcher driven by `scene.frames()`. |
 
@@ -660,10 +653,11 @@ flowchart TD
 ## 12. Key decisions (summary)
 
 1. **Camera = reference frame**; switching cameras = `compute_relative_state`
-   against a different frame. Frames are a **closed `FrameKind` enum +
-   `Other(String)` tail** (§3, revised 2026-06-04) — category-typed in core,
-   dynamic only for the open tail, with typed astrodyn markers at fixed sites.
-   Transform resolved once per occupied frame, applied by matrix to all geometry.
+   against a different frame. Frame identity is **`astrodyn_quantities::FrameUid`**
+   (§3, adopts astrodyn #659; supersedes the 2026-06-04 home-grown `FrameKind`
+   plan) — namespace/class/role/tag, with `FrameUid::of`/`is` as the typed bridge
+   and `external` + `FrameRole::Custom` for runtime-only frames. Transform resolved
+   once per occupied frame, applied by matrix to all geometry.
 2. **astrotui is a host-agnostic plugin**; the primary host is a long-lived
    orchestrator whose **viz lifecycle is independent of the sim's**.
 3. **Sims run as separate processes** streaming a wire format; **telemetry is the
@@ -676,9 +670,12 @@ flowchart TD
 6. **Ingestion is scoped layers**: named `SceneWriter`s own disjoint id sets;
    `commit()` replaces only that layer; render = live union; independent lifecycle
    *and* cadence per producer.
-7. **Interchange is one self-describing stream** (`astrotui-wire`): header
-   (topology + metadata) + frame-tagged samples; serves socket, telemetry, and
-   replay identically; replayable without the producer's code.
+7. **Frame interchange is `astrodyn_frame_doc`** (astrodyn #659): a keyframe
+   (`DocHeader` + interned `FrameUid` table) then per-epoch `EpochRow` records —
+   bit-exact, validated, replayable without the producer's code. `astrotui-wire` is
+   the **outer framing** (the socket keyframe handshake + the object/scene records
+   that ride alongside, referencing frames by `FrameUid`); it serves socket,
+   telemetry, and replay identically.
 8. **Snapshot / double-buffer** decouples producer rate from TUI frame rate;
    states kept in natural frames, camera applied per-render.
 9. **Trails are a plugin-provided container, producer-populated** at full rate;

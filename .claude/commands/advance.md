@@ -8,14 +8,18 @@ until there is no actionable work or you hit a stop condition. Reconcile ALL sta
 GitHub — never assume memory from a prior run.
 
 ## Context
-- Repo: `simnaut/astrotui` (default branch: `main`). Project #1 (owner `simnaut`) with
-  fields **Phase**, **Type**, **Status**.
+- Repo: `simnaut/astrotui` (default branch: `main`). Project #1 (owner `simnaut`) tracks
+  **Type**/**Status** (and a human-facing **Phase**). Use the Project only for Status
+  updates — **never** to decide work order (that's the dependency graph; see Selection).
 - Backlog = GitHub issues. `type:epic` issues are containers — **never implement them
   directly**; do work only on `type:task` (code) and `type:spec` (write the design doc,
   not code) issues.
-- Dependencies are fully encoded as GitHub **blocked-by** edges (phase chain +
-  open-item gates + intra-phase order). An issue is **unblocked** iff every issue under
-  `gh api repos/simnaut/astrotui/issues/<N>/dependencies/blocked_by` is CLOSED.
+- **All work ordering lives in the GitHub dependency graph** — `blocked-by` edges encode
+  phase sequencing (each phase's entry tasks are `blocked-by` the previous phase's epic),
+  open-item gates, and intra-phase order. An issue is **actionable** iff every issue under
+  `gh api repos/simnaut/astrotui/issues/<N>/dependencies/blocked_by` is CLOSED. This skill
+  holds **no** milestone/phase knowledge; new phases are sequenced by adding edges in the
+  Project, never by editing this file.
 - The design doc `docs/DESIGN.md` is the source of truth. Respect the architectural
   firewall: **astrotui-core links no Bevy and no ANISE/ephemeris** (Bevy lives only in
   the sim-side exporter / `apps/refsim`; ephemeris only in the body-filler producer).
@@ -23,18 +27,25 @@ GitHub — never assume memory from a prior run.
   GraphQL query and resolve them with `resolveReviewThread`; edit PR bodies via the REST
   PATCH (`gh pr edit` fails on this repo).
 - **Merge gate:** `main` is protected (squash-only, no direct pushes, enforced for
-  admins) and requires three status checks green before merge — `test`, `firewall`, and
-  `claude-review` (an **independent CI review** that runs automatically on every PR).
+  admins) and requires **four** status checks green before merge — `test`, `firewall`,
+  `claude-review` (an **independent CI review** that runs automatically on every PR), and
+  `mermaid` (validates ` ```mermaid ` diagrams in tracked markdown).
   Review findings — from the CI review and the repo's Copilot reviewer — are posted as
   inline review threads that must be resolved before merge (required conversation
   resolution). This loop does NOT self-review — it responds to those reviews (Phase A).
   Never bypass with `gh pr merge --admin`.
 
-## Selection order ("earliest")
-1. Restrict to the **earliest phase (milestone)** that still has any open
-   `type:task`/`type:spec` issue — milestone order is Pre-P0 → P0 → P1 → P2 → P3 → P4.
-   Do not start a later phase while an earlier one has open work.
-2. Within that phase, pick the earliest **unblocked** issue by ascending issue number.
+## Selection — purely from the dependency graph (no milestone/phase knowledge)
+Ordering lives entirely in the GitHub **`blocked-by` dependency graph**, not in this skill.
+Do **not** consult milestones or the Project `Phase` field to decide sequence — they are
+human grouping only. The next task is:
+1. Consider every open `type:task`/`type:spec` issue that is **actionable** — every issue
+   under `…/issues/<N>/dependencies/blocked_by` is CLOSED.
+2. Among those, pick the **lowest issue number**. That's the next task.
+
+Phase sequencing is encoded as edges (each phase's entry tasks are `blocked-by` the prior
+phase's **epic**), so closing a phase's epic releases the next phase — which is why Phase A
+closes completed epics. The skill never needs to know what the phases are.
 
 ## The cycle — run PHASE A first (open PRs are closest to done), then PHASE B.
 
@@ -57,17 +68,22 @@ GitHub — never assume memory from a prior run.
      treat them as blocking.
    - **Review threads:** ensure every unresolved thread (from the CI review or anywhere
      else, e.g. a human) is addressed on the branch and resolved via `resolveReviewThread`.
-   - **Merge:** only when **all three required checks are green** (`test`, `firewall`,
-     `claude-review`) AND zero unresolved threads AND the PR is mergeable → `gh pr merge
-     <N> --auto --squash` (auto-merge is enabled; GitHub merges once the gates pass).
-     Never bypass with `--admin`.
+   - **Merge:** only when **all four required checks are green** (`test`, `firewall`,
+     `claude-review`, `mermaid`) AND zero unresolved threads AND the PR is mergeable →
+     `gh pr merge <N> --auto --squash`. If `--auto` doesn't land it once green (it
+     sometimes doesn't fire), merge with `gh pr merge <N> --squash`. Never bypass with
+     `--admin`.
 3. A merged PR with `Closes #<issue>` closes its issue; set that issue's Project Status
    to **Done** if it didn't happen automatically.
+4. **Close completed epics.** For each open `type:epic`, if all its sub-issues are CLOSED
+   (`gh issue view <epic> --json subIssuesSummary`), close the epic. Phase-entry tasks are
+   `blocked-by` the prior phase's epic, so this is what releases the next phase.
 
 ### PHASE B — start the next task (only if it has no open PR yet)
-1. Select the earliest unblocked open `type:task`/`type:spec` issue (per the order
-   above) that has **no existing open PR** (check open PR bodies for `Closes #<N>` and
-   branches named `issue-<N>-*`). If none exists, **STOP** and report "no actionable work."
+1. Select the next task per **Selection** above (the lowest-numbered actionable
+   `type:task`/`type:spec`) that has **no existing open PR** (check open PR bodies for
+   `Closes #<N>` and branches named `issue-<N>-*`). If none exists, **STOP** and report
+   "no actionable work."
 2. **Idempotency:** if a branch `issue-<N>-*` or a PR for `#<N>` already exists, switch
    to PHASE A on it instead of creating a duplicate.
 3. Mark start: set the issue's Project Status to **In Progress**; comment that you're

@@ -68,19 +68,56 @@ pub struct ProjectedPoint {
     pub pos_cam: DVec3,
 }
 
-/// Project a snapshot's objects into `area` as seen from `camera` — DESIGN.md §4.4 steps
-/// 1–4, point-only. Objects whose frame is unknown, or that fall outside `area`, are
-/// omitted. Returns one [`ProjectedPoint`] per visible object, in `snap.objects()` order.
-#[must_use]
-pub fn project_points(snap: &Snapshot, camera: &Camera, area: Rect) -> Vec<ProjectedPoint> {
-    if camera.scale <= 0.0 || area.width == 0 || area.height == 0 {
-        return Vec::new();
+/// Diagnostics from a projection pass: what could **not** be rendered, so the host can
+/// surface it instead of presenting a silently blank screen (DESIGN.md §4.4 — loud, never
+/// silent). Off-screen objects are normal culling and are *not* reported here.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RenderReport {
+    /// Objects whose `frame` uid is absent from the resolved `FrameTree`.
+    pub orphan_objects: Vec<ObjectId>,
+    /// Frames dropped while building the tree: a root-ineligible identity, or a child whose
+    /// parent never resolved (a dangling or cyclic parent).
+    pub dropped_frames: Vec<FrameUid>,
+    /// Set when the camera's own frame is absent from the tree — nothing can be drawn.
+    pub unresolved_camera_frame: Option<FrameUid>,
+}
+
+impl RenderReport {
+    /// `true` when every object and frame resolved and the camera frame was found.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.orphan_objects.is_empty()
+            && self.dropped_frames.is_empty()
+            && self.unresolved_camera_frame.is_none()
     }
-    let Some((tree, ids)) = build_tree(snap) else {
-        return Vec::new();
+}
+
+/// Project a snapshot's objects into `area` as seen from `camera` — DESIGN.md §4.4 steps
+/// 1–4, point-only. Returns one [`ProjectedPoint`] per visible object (in `snap.objects()`
+/// order) **and** a [`RenderReport`] of what could not be rendered — orphan objects, dropped
+/// frames, and an absent camera frame are *surfaced*, never silently culled (§4.4). Objects
+/// that simply fall outside `area` are omitted as normal culling (not reported).
+#[must_use]
+pub fn project_points(
+    snap: &Snapshot,
+    camera: &Camera,
+    area: Rect,
+) -> (Vec<ProjectedPoint>, RenderReport) {
+    if camera.scale <= 0.0 || area.width == 0 || area.height == 0 {
+        return (Vec::new(), RenderReport::default());
+    }
+    let (built, dropped_frames) = build_tree(snap);
+    let mut report = RenderReport {
+        dropped_frames,
+        ..RenderReport::default()
+    };
+    let Some((tree, ids)) = built else {
+        return (Vec::new(), report);
     };
     let Some(&cam_id) = ids.get(&camera.frame) else {
-        return Vec::new();
+        // The eye's own frame isn't in the tree: nothing can be drawn — surface it loudly.
+        report.unresolved_camera_frame = Some(camera.frame.clone());
+        return (Vec::new(), report);
     };
 
     // Resolve ONE transform per occupied frame and apply it to every object in that frame
@@ -91,6 +128,7 @@ pub fn project_points(snap: &Snapshot, camera: &Camera, area: Rect) -> Vec<Proje
     let mut out = Vec::with_capacity(snap.objects().len());
     for obj in snap.objects() {
         let Some(&frame_id) = ids.get(&obj.frame) else {
+            report.orphan_objects.push(obj.id.clone());
             continue;
         };
         let (origin, r_frame_to_cam) = *by_frame.entry(frame_id).or_insert_with(|| {
@@ -107,18 +145,23 @@ pub fn project_points(snap: &Snapshot, camera: &Camera, area: Rect) -> Vec<Proje
             });
         }
     }
-    out
+    (out, report)
 }
 
-/// Build an astrodyn `FrameTree` from the snapshot's frame records, returning it alongside
-/// a map from scene [`FrameUid`] to the arena's `usize` frame id. Frames are stamped by
-/// their uid (astrodyn #659) and added parent-before-child; frames whose parent is missing
-/// are dropped. `None` if there are no frames. Frame *orientation* is simplified here
-/// (translational placement, identity rotation) — sufficient for the overview; rotating
-/// frames land in P2. (Loud surfacing of dropped/dangling frames is #76.)
-fn build_tree(snap: &Snapshot) -> Option<(FrameTree, HashMap<FrameUid, usize>)> {
+/// A built frame arena: the astrodyn `FrameTree` plus the map from scene [`FrameUid`] to the
+/// arena's `usize` frame id.
+type FrameArena = (FrameTree, HashMap<FrameUid, usize>);
+
+/// Build an astrodyn `FrameTree` from the snapshot's frame records. Returns the arena
+/// (`None` if no frame resolved) **and** the uids of frames that were dropped — a
+/// root-ineligible identity, or a child whose parent never resolved — so the caller can
+/// surface them (#76). Frames are stamped by their uid (astrodyn #659) and added
+/// parent-before-child. Frame *orientation* is simplified here (translational placement,
+/// identity rotation) — sufficient for the overview; rotating frames land in P2.
+fn build_tree(snap: &Snapshot) -> (Option<FrameArena>, Vec<FrameUid>) {
     let mut tree = FrameTree::new();
     let mut ids: HashMap<FrameUid, usize> = HashMap::new();
+    let mut dropped: Vec<FrameUid> = Vec::new();
     let mut remaining: Vec<_> = snap.frames().iter().collect();
 
     let mut progress = true;
@@ -127,9 +170,10 @@ fn build_tree(snap: &Snapshot) -> Option<(FrameTree, HashMap<FrameUid, usize>)> 
         remaining.retain(|fr| match &fr.parent {
             None => {
                 // A root frame's identity must be root-eligible; drop a malformed root
-                // rather than panicking in the render path (loud surfacing is #76). Root
-                // state is the inertial origin (identity); any supplied state is ignored.
+                // rather than panicking in the render path. Root state is the inertial
+                // origin (identity); any supplied state is ignored.
                 if !fr.uid.class.may_be_root_or_integ() {
+                    dropped.push(fr.uid.clone());
                     return false;
                 }
                 ids.insert(
@@ -152,15 +196,18 @@ fn build_tree(snap: &Snapshot) -> Option<(FrameTree, HashMap<FrameUid, usize>)> 
                     progress = true;
                     false
                 }
-                None => true, // parent not added yet (or missing) — retry / drop
+                None => true, // parent not added yet (or missing) — retry, else dropped below
             },
         });
     }
+    // Anything still pending after no further progress had a parent that never resolved
+    // (dangling or cyclic) — record it as dropped so the caller can surface it.
+    dropped.extend(remaining.iter().map(|fr| fr.uid.clone()));
 
     if ids.is_empty() {
-        None
+        (None, dropped)
     } else {
-        Some((tree, ids))
+        (Some((tree, ids)), dropped)
     }
 }
 
@@ -226,10 +273,12 @@ impl StatefulWidget for SpaceView<'_> {
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut SceneStore) {
         let snapshot = state.snapshot();
-        let points: Vec<(f64, f64)> = project_points(&snapshot, self.camera, area)
-            .into_iter()
-            .map(|p| (p.col, p.row))
-            .collect();
+        // The widget draws the projected points; a host that wants the unresolved-frame
+        // diagnostics (DESIGN §4.4) calls `project_points` directly and inspects the
+        // [`RenderReport`] (e.g. for a status line). The widget itself has no surface to
+        // show them on.
+        let (projected, _report) = project_points(&snapshot, self.camera, area);
+        let points: Vec<(f64, f64)> = projected.into_iter().map(|p| (p.col, p.row)).collect();
         self.renderer.draw_points(&points, area, buf);
     }
 }
@@ -277,7 +326,7 @@ mod tests {
     fn projects_to_viewport_centre_and_offsets() {
         let snap = scene(&[("origin", at(0.0, 0.0)), ("right", at(4.0, 0.0))]);
         let cam = Camera::overview(root(), 2.0); // 2 m per cell
-        let pts = project_points(&snap, &cam, area());
+        let (pts, _) = project_points(&snap, &cam, area());
 
         let origin = pts.iter().find(|p| p.id.as_str() == "origin").unwrap();
         assert_eq!((origin.col, origin.row), (10.0, 5.0)); // centre of the 20x10 area
@@ -290,8 +339,8 @@ mod tests {
         // The same object projects to the same LOCAL (col, row) wherever the area sits.
         let snap = scene(&[("o", at(0.0, 0.0))]);
         let cam = Camera::overview(root(), 1.0);
-        let p0 = project_points(&snap, &cam, Rect::new(0, 0, 20, 10));
-        let p1 = project_points(&snap, &cam, Rect::new(7, 3, 20, 10));
+        let (p0, _) = project_points(&snap, &cam, Rect::new(0, 0, 20, 10));
+        let (p1, _) = project_points(&snap, &cam, Rect::new(7, 3, 20, 10));
         assert_eq!((p0[0].col, p0[0].row), (10.0, 5.0));
         assert_eq!((p1[0].col, p1[0].row), (10.0, 5.0)); // independent of area.x/area.y
     }
@@ -308,7 +357,7 @@ mod tests {
         let snap = store.snapshot();
 
         // From the root camera, the probe sits at 105 m in x.
-        let pts = project_points(
+        let (pts, _) = project_points(
             &snap,
             &Camera::overview(root(), 1.0),
             Rect::new(0, 0, 400, 10),
@@ -318,7 +367,7 @@ mod tests {
         assert_eq!((probe.col, probe.row), (305.0, 5.0)); // centre 200 + 105 m
 
         // From a camera riding the child frame, the same probe is only 5 m in x.
-        let pts = project_points(
+        let (pts, _) = project_points(
             &snap,
             &Camera::overview(child(), 1.0),
             Rect::new(0, 0, 40, 10),
@@ -340,7 +389,7 @@ mod tests {
         tx.commit();
         let snap = store.snapshot();
 
-        let pts = project_points(
+        let (pts, _) = project_points(
             &snap,
             &Camera::overview(root(), 1.0),
             Rect::new(0, 0, 400, 10),
@@ -370,7 +419,7 @@ mod tests {
                 },
             ),
         ]);
-        let pts = project_points(&snap, &Camera::overview(root(), 1.0), area());
+        let (pts, _) = project_points(&snap, &Camera::overview(root(), 1.0), area());
         let ids: Vec<&str> = pts.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["ok"]); // NaN/∞ objects are dropped, not mapped to (0,0)
     }
@@ -378,19 +427,67 @@ mod tests {
     #[test]
     fn offscreen_objects_are_culled() {
         let snap = scene(&[("near", at(0.0, 0.0)), ("far", at(1_000.0, 0.0))]);
-        let pts = project_points(&snap, &Camera::overview(root(), 1.0), area());
+        let (pts, _) = project_points(&snap, &Camera::overview(root(), 1.0), area());
         let ids: Vec<&str> = pts.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["near"]); // "far" is off the 20-wide viewport
     }
 
     #[test]
-    fn empty_or_unknown_camera_frame_yields_nothing() {
+    fn unknown_camera_frame_yields_nothing_but_is_reported() {
         let snap = scene(&[("a", at(0.0, 0.0))]);
-        // `absent` is a valid identity that is simply not present in this scene.
-        assert!(project_points(&snap, &Camera::overview(absent(), 1.0), area()).is_empty());
-        assert!(project_points(&snap, &Camera::overview(root(), 0.0), area()).is_empty());
+        // `absent` is a valid identity that is simply not present in this scene: nothing
+        // renders, and that is surfaced (not a silent blank screen).
+        let (pts, report) = project_points(&snap, &Camera::overview(absent(), 1.0), area());
+        assert!(pts.is_empty());
+        assert_eq!(report.unresolved_camera_frame, Some(absent()));
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn degenerate_inputs_yield_nothing() {
+        let snap = scene(&[("a", at(0.0, 0.0))]);
+        assert!(
+            project_points(&snap, &Camera::overview(root(), 0.0), area())
+                .0
+                .is_empty()
+        );
         let empty = SceneStore::new().snapshot();
-        assert!(project_points(&empty, &Camera::overview(root(), 1.0), area()).is_empty());
+        let (pts, report) = project_points(&empty, &Camera::overview(root(), 1.0), area());
+        assert!(pts.is_empty() && report.is_clean()); // empty scene: nothing wrong
+    }
+
+    #[test]
+    fn orphan_object_is_reported_not_silently_dropped() {
+        // An object on a frame that isn't in the tree must be surfaced (DESIGN §4.4).
+        let store = SceneStore::new();
+        let mut tx = store.writer("p").begin(Epoch::from_seconds(0.0));
+        tx.frame(root(), None, BodyState::default()).object(
+            "ghost",
+            absent(),
+            at(0.0, 0.0),
+            ObjectMeta::default(),
+        );
+        tx.commit();
+        let (pts, report) =
+            project_points(&store.snapshot(), &Camera::overview(root(), 1.0), area());
+        assert!(pts.is_empty());
+        let orphans: Vec<&str> = report.orphan_objects.iter().map(|o| o.as_str()).collect();
+        assert_eq!(orphans, ["ghost"]);
+    }
+
+    #[test]
+    fn frame_with_unresolvable_parent_is_reported_dropped() {
+        // `child`'s declared parent (`absent`) is never added to the scene, so `child` can't
+        // be placed — it is reported dropped rather than silently vanishing.
+        let store = SceneStore::new();
+        let mut tx = store.writer("p").begin(Epoch::from_seconds(0.0));
+        tx.frame(root(), None, BodyState::default())
+            .frame(child(), Some(absent()), at(1.0, 0.0))
+            .object("here", root(), at(0.0, 0.0), ObjectMeta::default());
+        tx.commit();
+        let (_pts, report) =
+            project_points(&store.snapshot(), &Camera::overview(root(), 1.0), area());
+        assert_eq!(report.dropped_frames, vec![child()]);
     }
 
     /// Records the points handed to a renderer, so we can check what `SpaceView` projected.

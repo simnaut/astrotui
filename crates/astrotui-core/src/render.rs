@@ -56,7 +56,12 @@ impl Camera {
 /// sub-cell dot grid). `(col, row)` are measured from the area's top-left: `(0, 0)` is the
 /// top-left cell, `col` grows right, `row` grows down — independent of where the area sits
 /// in the buffer (the backend adds the `area.x`/`area.y` offset when it writes cells).
+///
+/// `#[non_exhaustive]`: this is an *output* of [`project_points`] — consumers read its
+/// fields, never construct it — so it is marked non-exhaustive to keep adding projection
+/// outputs (depth, angular size, …) from being a breaking change for downstream crates.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ProjectedPoint {
     /// Which object.
     pub id: ObjectId,

@@ -140,16 +140,28 @@ pub fn apply_document(doc: &FrameDocument, w: &mut SceneWriter) -> Result<(), Ap
 /// parent *index* is in range but not that it names an existing record, so a dangling parent
 /// slips past it — caught loudly here. Call after `validate()` (indices are assumed in range).
 fn check_parents(uids: &[FrameUid], records: &[FrameRecord]) -> Result<(), ApplyError> {
+    // Use `get(...).expect("…validated by apply_*")` (as `stage_records` does) so a violated
+    // upstream contract surfaces a clear message, not an opaque bounds panic.
+    let uid = |i: u32| -> FrameUid {
+        uids.get(i as usize)
+            .expect("uid index in range (validated by apply_*)")
+            .clone()
+    };
     let mut provided = vec![false; uids.len()];
     for r in records {
-        provided[r.uid_index as usize] = true;
+        *provided
+            .get_mut(r.uid_index as usize)
+            .expect("uid_index in range (validated by apply_*)") = true;
     }
     for r in records {
         if let Some(p) = r.parent {
-            if !provided[p as usize] {
+            let parent_provided = *provided
+                .get(p as usize)
+                .expect("parent index in range (validated by apply_*)");
+            if !parent_provided {
                 return Err(ApplyError::DanglingParent {
-                    child: uids[r.uid_index as usize].clone(),
-                    parent: uids[p as usize].clone(),
+                    child: uid(r.uid_index),
+                    parent: uid(p),
                 });
             }
         }

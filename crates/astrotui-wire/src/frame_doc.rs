@@ -431,6 +431,136 @@ mod tests {
         assert!(matches!(err, ApplyError::NoSuchEpoch));
     }
 
+    // #77 — the end-to-end rotating-frame proof that gates P2. A `CanonicalRotation` on a
+    // frame must survive the full pipeline (doc quat → glam `DQuat` → `BodyState.attitude` →
+    // `frame_state` → JEOD `q_parent_this` → `FrameTree` → `compute_relative_state` → camera
+    // state) and orient both an object's *position* and its *body axes* (`att_cam`). Asserted
+    // against hand-typed references so a convention slip (active/passive, scalar position,
+    // transpose direction) fails loudly rather than silently mis-orienting the Moon in P2.
+    #[test]
+    fn rotating_frame_orients_position_and_attitude_through_camera() {
+        use astrotui_core::render::{project_points, Camera};
+        use astrotui_core::scene::ObjectMeta;
+        use ratatui::layout::Rect;
+        use std::f64::consts::FRAC_1_SQRT_2;
+
+        // Child frame (PlanetFixed<Moon>) carrying a 90°-about-Z rotation relative to root,
+        // offset by `offset`. Doc quat is scalar-first glam convention [w, x, y, z], so
+        // [c, 0, 0, s] decodes to glam `DQuat::from_rotation_z(+π/2)`. The values below pin
+        // the *observed* end-to-end convention: through `JeodQuat::from_glam` →
+        // `left_quat_to_transformation` → `compute_relative_state`, this orients the child so
+        // its +x basis axis points along root **−y** (i.e. child→root maps x→−y, y→+x). A
+        // future convention slip flips these signs and fails the asserts below.
+        let offset = [10.0, 20.0, 30.0];
+        let z90 = || CanonicalRotation::Quat([FRAC_1_SQRT_2, 0.0, 0.0, FRAC_1_SQRT_2]);
+        let doc = FrameDocument {
+            header: header(),
+            uids: vec![root_uid(), child_uid()],
+            records: vec![
+                rec("root", 0, None, 0.0, [0.0; 3], ident()),
+                rec("moon_fixed", 1, Some(0), 0.0, offset, z90()),
+            ],
+        };
+
+        // Exercise the real consume path: serialize and decode (the deserialize the issue
+        // calls for) before applying, so the rotation survives the wire, not just a literal.
+        let doc = FrameDocument::from_json_str(&doc.to_json_string()).expect("valid json");
+
+        let store = SceneStore::new();
+        apply_document(&doc, &mut store.writer("wire")).unwrap();
+        // frame_doc carries no objects; place two in the rotated child via a separate layer.
+        // `probe` has identity attitude (isolates the frame rotation); `tilted` carries its
+        // own +90°-about-Z body attitude (exercises the body→frame→camera composition).
+        let d = 5.0;
+        let writer = store.writer("obj");
+        let mut tx = writer.begin(Epoch::from_seconds(0.0));
+        tx.object(
+            "probe",
+            child_uid(),
+            BodyState {
+                position: DVec3::new(d, 0.0, 0.0),
+                velocity: DVec3::ZERO,
+                attitude: DQuat::IDENTITY,
+            },
+            ObjectMeta::default(),
+        )
+        .object(
+            "tilted",
+            child_uid(),
+            BodyState {
+                position: DVec3::ZERO,
+                velocity: DVec3::ZERO,
+                attitude: DQuat::from_rotation_z(std::f64::consts::FRAC_PI_2),
+            },
+            ObjectMeta::default(),
+        );
+        tx.commit();
+
+        let snap = store.snapshot();
+        let area = Rect::new(0, 0, 400, 400);
+        let (pts, report) = project_points(&snap, &Camera::overview(root_uid(), 1.0), area);
+        assert!(
+            report.is_clean(),
+            "rotating-frame scene must resolve cleanly: {report:?}"
+        );
+
+        let probe = pts.iter().find(|p| p.id.as_str() == "probe").unwrap();
+        // The child's +x axis points along root −y, so the probe at child [5,0,0] maps to
+        // root [0,−5,0], plus the frame offset → [10,15,30].
+        let expected_pos = DVec3::new(offset[0], offset[1] - d, offset[2]);
+        assert!(
+            probe.pos_cam.abs_diff_eq(expected_pos, 1e-9),
+            "probe pos_cam {:?} != {expected_pos:?}",
+            probe.pos_cam
+        );
+        // Identity-attitude object: att_cam == frame→camera (child→root). Its columns are the
+        // child basis axes in root coords: child-x→−y, child-y→+x, child-z→+z.
+        let child_to_root = DMat3::from_cols(
+            DVec3::new(0.0, -1.0, 0.0),
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(0.0, 0.0, 1.0),
+        );
+        assert!(
+            probe.att_cam.abs_diff_eq(child_to_root, 1e-9),
+            "probe att_cam {:?} != {child_to_root:?}",
+            probe.att_cam
+        );
+
+        // The tilted object adds another +90° about Z on top of the frame's +90° → 180°
+        // about Z in camera coords (body axes: +x→−x, +y→−y, +z→+z).
+        let tilted = pts.iter().find(|p| p.id.as_str() == "tilted").unwrap();
+        let body_to_root = DMat3::from_cols(
+            DVec3::new(-1.0, 0.0, 0.0),
+            DVec3::new(0.0, -1.0, 0.0),
+            DVec3::new(0.0, 0.0, 1.0),
+        );
+        assert!(
+            tilted.att_cam.abs_diff_eq(body_to_root, 1e-9),
+            "tilted att_cam {:?} != {body_to_root:?}",
+            tilted.att_cam
+        );
+
+        // The loud parent-mismatch path, with a rotating frame in play: a rotated child whose
+        // named parent has no record must still be rejected (nothing committed), proving the
+        // RFS-301/302 stale-parent guard isn't bypassed once rotations are present.
+        let dangling = FrameDocument {
+            header: header(),
+            uids: vec![root_uid(), child_uid(), FrameUid::of::<PlanetFixed<Mars>>()],
+            records: vec![
+                rec("root", 0, None, 0.0, [0.0; 3], ident()),
+                // parent index 2 (Mars) is a valid index but has no record → dangling.
+                rec("moon_fixed", 1, Some(2), 0.0, offset, z90()),
+            ],
+        };
+        let store = SceneStore::new();
+        let err = apply_document(&dangling, &mut store.writer("wire")).unwrap_err();
+        assert!(matches!(err, ApplyError::DanglingParent { .. }));
+        assert!(
+            store.snapshot().is_empty(),
+            "nothing committed on dangling parent"
+        );
+    }
+
     #[test]
     fn document_producer_populates() {
         let store = SceneStore::new();

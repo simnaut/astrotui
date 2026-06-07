@@ -139,6 +139,7 @@ dependencies = [
  "astrodyn_quantities",
  "astrotui-core",
  "glam",
+ "ratatui",
 ]
 
 [[package]]

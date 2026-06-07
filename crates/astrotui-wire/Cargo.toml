@@ -15,5 +15,10 @@ astrodyn_frame_doc = { workspace = true }
 astrodyn_quantities = { workspace = true }
 glam = "0.30"          # DVec3/DQuat to build core BodyState (must match core's glam)
 
+[dev-dependencies]
+# Test-only: the rotating-frame integration test (#77) drives core's `project_points`,
+# whose viewport argument is a ratatui `Rect`. Not a runtime dep — wire produces no UI.
+ratatui = { workspace = true }
+
 [lints]
 workspace = true

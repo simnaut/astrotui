@@ -35,7 +35,7 @@ dependencies = [
 [[package]]
 name = "astrodyn_frame_doc"
 version = "0.2.0"
-source = "git+https://github.com/simnaut/astrodyn?rev=045804f9fa895fba6682c6c424ef949fbadf305b#045804f9fa895fba6682c6c424ef949fbadf305b"
+source = "git+https://github.com/simnaut/astrodyn?rev=85ba7f4f159581b181925a86d1de16864cf329fc#85ba7f4f159581b181925a86d1de16864cf329fc"
 dependencies = [
  "astrodyn_quantities",
  "serde",
@@ -46,7 +46,7 @@ dependencies = [
 [[package]]
 name = "astrodyn_frames"
 version = "0.2.0"
-source = "git+https://github.com/simnaut/astrodyn?rev=045804f9fa895fba6682c6c424ef949fbadf305b#045804f9fa895fba6682c6c424ef949fbadf305b"
+source = "git+https://github.com/simnaut/astrodyn?rev=85ba7f4f159581b181925a86d1de16864cf329fc#85ba7f4f159581b181925a86d1de16864cf329fc"
 dependencies = [
  "astrodyn_math",
  "astrodyn_quantities",
@@ -57,7 +57,7 @@ dependencies = [
 [[package]]
 name = "astrodyn_math"
 version = "0.2.0"
-source = "git+https://github.com/simnaut/astrodyn?rev=045804f9fa895fba6682c6c424ef949fbadf305b#045804f9fa895fba6682c6c424ef949fbadf305b"
+source = "git+https://github.com/simnaut/astrodyn?rev=85ba7f4f159581b181925a86d1de16864cf329fc#85ba7f4f159581b181925a86d1de16864cf329fc"
 dependencies = [
  "astrodyn_quantities",
  "glam",
@@ -68,7 +68,7 @@ dependencies = [
 [[package]]
 name = "astrodyn_planet"
 version = "0.2.0"
-source = "git+https://github.com/simnaut/astrodyn?rev=045804f9fa895fba6682c6c424ef949fbadf305b#045804f9fa895fba6682c6c424ef949fbadf305b"
+source = "git+https://github.com/simnaut/astrodyn?rev=85ba7f4f159581b181925a86d1de16864cf329fc#85ba7f4f159581b181925a86d1de16864cf329fc"
 dependencies = [
  "astrodyn_quantities",
  "glam",
@@ -80,7 +80,7 @@ dependencies = [
 [[package]]
 name = "astrodyn_quantities"
 version = "0.2.0"
-source = "git+https://github.com/simnaut/astrodyn?rev=045804f9fa895fba6682c6c424ef949fbadf305b#045804f9fa895fba6682c6c424ef949fbadf305b"
+source = "git+https://github.com/simnaut/astrodyn?rev=85ba7f4f159581b181925a86d1de16864cf329fc#85ba7f4f159581b181925a86d1de16864cf329fc"
 dependencies = [
  "glam",
  "serde",

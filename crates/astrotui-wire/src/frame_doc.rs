@@ -34,6 +34,15 @@ pub enum ApplyError {
     },
     /// The requested segment/epoch index is out of range for the series.
     NoSuchEpoch,
+    /// A scene-level validation failure (orphan object, non-finite object field, bad shape,
+    /// or a frame/object timeline mismatch) — see [`crate::scene_doc::SceneError`] (#21).
+    Scene(crate::scene_doc::SceneError),
+}
+
+impl From<crate::scene_doc::SceneError> for ApplyError {
+    fn from(e: crate::scene_doc::SceneError) -> Self {
+        ApplyError::Scene(e)
+    }
 }
 
 impl From<DocError> for ApplyError {
@@ -53,6 +62,7 @@ impl std::fmt::Display for ApplyError {
                 )
             }
             ApplyError::NoSuchEpoch => write!(f, "series segment/epoch index out of range"),
+            ApplyError::Scene(e) => write!(f, "invalid scene document: {e}"),
         }
     }
 }
@@ -66,7 +76,7 @@ impl std::error::Error for ApplyError {}
 /// **structural** conversion only — the exact JEOD left-transform ↔ glam convention is
 /// validated by the rotating-frame integration test (#77); the renderer does not read
 /// attitude yet, so #75 just carries the value faithfully.
-fn rotation_to_dquat(r: &CanonicalRotation) -> DQuat {
+pub(crate) fn rotation_to_dquat(r: &CanonicalRotation) -> DQuat {
     match r {
         CanonicalRotation::Quat([q0, q1, q2, q3]) => DQuat::from_xyzw(*q1, *q2, *q3, *q0),
         CanonicalRotation::Matrix(cols) => DQuat::from_mat3(&DMat3::from_cols(
@@ -97,7 +107,7 @@ fn body_state(rec: &FrameRecord) -> BodyState {
 /// granularity is collapsed here (matches the current ingestion API). The header `simtime`
 /// is deliberately NOT used — it is elapsed sim seconds, a different scale than
 /// `Epoch = SecondsSince<TDB>`.
-fn tx_epoch(records: &[FrameRecord]) -> Epoch {
+pub(crate) fn tx_epoch(records: &[FrameRecord]) -> Epoch {
     let secs = records.first().and_then(|r| r.epoch).unwrap_or(0.0);
     Epoch::from_seconds(secs)
 }
@@ -105,7 +115,7 @@ fn tx_epoch(records: &[FrameRecord]) -> Epoch {
 /// Stage every record onto an open transaction, resolving uid-table indices into
 /// [`FrameUid`]s. Index ranges are guaranteed in-bounds by the prior `validate()`; the
 /// `expect` ties any violation back to that contract rather than panicking opaquely.
-fn stage_records(tx: &mut Transaction, uids: &[FrameUid], records: &[FrameRecord]) {
+pub(crate) fn stage_records(tx: &mut Transaction, uids: &[FrameUid], records: &[FrameRecord]) {
     for rec in records {
         let uid = uids
             .get(rec.uid_index as usize)
@@ -139,7 +149,7 @@ pub fn apply_document(doc: &FrameDocument, w: &mut SceneWriter) -> Result<(), Ap
 /// parent self-check against the folded topology). `astrodyn_frame_doc::validate` checks a
 /// parent *index* is in range but not that it names an existing record, so a dangling parent
 /// slips past it — caught loudly here. Call after `validate()` (indices are assumed in range).
-fn check_parents(uids: &[FrameUid], records: &[FrameRecord]) -> Result<(), ApplyError> {
+pub(crate) fn check_parents(uids: &[FrameUid], records: &[FrameRecord]) -> Result<(), ApplyError> {
     // Use `get(...).expect("…validated by apply_*")` (as `stage_records` does) so a violated
     // upstream contract surfaces a clear message, not an opaque bounds panic.
     let uid = |i: u32| -> FrameUid {

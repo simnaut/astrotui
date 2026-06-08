@@ -136,10 +136,13 @@ name = "astrotui-wire"
 version = "0.0.0"
 dependencies = [
  "astrodyn_frame_doc",
+ "astrodyn_planet",
  "astrodyn_quantities",
  "astrotui-core",
  "glam",
  "ratatui",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

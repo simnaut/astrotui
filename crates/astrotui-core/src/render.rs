@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 
 use astrodyn_frames::{FrameTree, RefFrameRot, RefFrameState, RefFrameTrans};
+use astrodyn_quantities::frame_identity::topocentric_site_frame_uid;
 use astrodyn_quantities::{
     BodyFrame, FrameUid, JeodQuat, Lvlh, Ned, Planet, PlanetFixed, PlanetInertial, RootInertial,
     Vehicle,
@@ -197,10 +198,17 @@ impl Camera {
         Self::in_frame(FrameUid::of::<BodyFrame<V>>(), scale)
     }
 
-    // NOTE: the **local-horizon** preset over `Topocentric<P>` is intentionally absent — it is
-    // paused on astrodyn simnaut/astrodyn#688. `FrameUid::of::<Topocentric<P>>()` is keyed by
-    // planet only, so every ground site on a planet collides on one identity; we wait for typed
-    // multi-site identity rather than ship a single-site stopgap. Add it once #688 lands.
+    /// **Local horizon** — a site-anchored topocentric (ENU) frame on planet `P` (landing site,
+    /// ground station). Unlike the other presets, a topocentric frame's identity is **value-keyed**
+    /// by `(planet, site)`: `FrameUid::of::<Topocentric<P>>()` is keyed by planet alone, so every
+    /// site on `P` would collide — astrodyn mints site-distinguished uids through the one shared
+    /// [`topocentric_site_frame_uid`] (astrodyn #688/#696), which a producer and the viz both call
+    /// so they converge byte-for-byte. `site` is a stable site key (e.g. `"KSC-LC39A"`); the
+    /// geodetic anchor itself rides the frame's transform in the scene, not the identity.
+    #[must_use]
+    pub fn local_horizon<P: Planet>(site: &str, scale: f64) -> Self {
+        Self::in_frame(topocentric_site_frame_uid(P::NAME, site), scale)
+    }
 
     /// Build the orthonormal [`ViewBasis`] for a resolved `forward` view axis (in camera-frame
     /// coordinates), applying this camera's [`UpHint`]. Gimbal-guarded — see [`orthonormal_view`].
@@ -731,6 +739,34 @@ mod tests {
             Camera::body_fixed::<Moon>(1.0).frame,
             Camera::body_fixed::<Mars>(1.0).frame
         );
+    }
+
+    #[test]
+    fn local_horizon_sites_have_distinct_value_keyed_identities() {
+        // The whole point of astrodyn #688/#696: two sites on one planet must NOT collide, and a
+        // given (planet, site) is stable (so a producer and the viz converge on one FrameUid).
+        let a = Camera::local_horizon::<Moon>("shackleton", 1.0);
+        let b = Camera::local_horizon::<Moon>("malapert", 1.0);
+        assert_ne!(a.frame, b.frame, "two lunar sites must not alias");
+        assert_eq!(
+            a.frame,
+            Camera::local_horizon::<Moon>("shackleton", 2.0).frame,
+            "same (planet, site) is stable across calls"
+        );
+        // Same site key on a different planet is still distinct.
+        assert_ne!(
+            a.frame,
+            Camera::local_horizon::<Mars>("shackleton", 1.0).frame
+        );
+        // It is a Topocentric identity, and a site uid is NOT the planet-only typed uid.
+        assert_eq!(a.frame.class, astrodyn_quantities::FrameClass::Topocentric);
+        assert_ne!(
+            a.frame,
+            FrameUid::of::<astrodyn_quantities::Topocentric<Moon>>()
+        );
+        // Default target/up match the other presets.
+        assert_eq!(a.target, CameraTarget::FrameOrigin(a.frame.clone()));
+        assert_eq!(a.up, UpHint::FrameUp);
     }
 
     #[test]

@@ -12,8 +12,13 @@ description = "Scene wire adapter for astrotui: consumes astrodyn_frame_doc (sna
 # adapts it into the core SceneStore. wire -> core is acyclic (core never depends on wire).
 astrotui-core = { workspace = true }
 astrodyn_frame_doc = { workspace = true }
-astrodyn_quantities = { workspace = true }
+# `serde` feature: this crate embeds `FrameUid` in its own object records (#21), so it needs
+# FrameUid's serde derives (gated in astrodyn_quantities). Don't rely on feature unification.
+astrodyn_quantities = { workspace = true, features = ["serde"] }
+astrodyn_planet = { workspace = true }   # PlanetShape::new, to reconstruct object shapes (#21)
 glam = "0.30"          # DVec3/DQuat to build core BodyState (must match core's glam)
+serde = { workspace = true }             # derive Serialize/Deserialize on the wire records
+serde_json = { workspace = true }        # the JSON `WireCodec` (binary/postcard is P3)
 
 [dev-dependencies]
 # Test-only: the rotating-frame integration test (#77) drives core's `project_points`,

@@ -47,3 +47,9 @@ astrodyn_frame_doc = { git = "https://github.com/simnaut/astrodyn", rev = "85ba7
 # ratatui — shared across core + the render backends so the Buffer type in the
 # Renderer trait is the same everywhere.
 ratatui = "0.30"
+
+# serde stack — used only by the wire/adapter crate (astrotui-wire), never the render
+# core (DESIGN §3/§4.3: core holds FrameUid without serde). `float_roundtrip` matches
+# astrodyn_frame_doc's RFS-601 bit-exact f64 JSON fidelity.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }

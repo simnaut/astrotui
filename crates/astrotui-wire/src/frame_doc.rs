@@ -62,7 +62,7 @@ impl std::fmt::Display for ApplyError {
                 )
             }
             ApplyError::NoSuchEpoch => write!(f, "series segment/epoch index out of range"),
-            ApplyError::Scene(e) => write!(f, "invalid scene document: {e}"),
+            ApplyError::Scene(e) => write!(f, "scene wire error: {e}"),
         }
     }
 }

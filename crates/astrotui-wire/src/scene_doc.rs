@@ -18,7 +18,8 @@ use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
 use astrodyn_frame_doc::{
-    CanonicalRotation, DocError, FrameDocument, FrameRecord, FrameSeries, TransRecord,
+    validate_header, validate_record, validate_uid_table, CanonicalRotation, DocError,
+    FrameDocument, FrameRecord, FrameSeries, TransRecord,
 };
 use astrodyn_planet::PlanetShape;
 use astrodyn_quantities::FrameUid;
@@ -477,29 +478,62 @@ pub fn apply_scene_document(doc: &SceneDocument, w: &mut SceneWriter) -> Result<
 /// Apply one epoch `(segment, epoch)` of a [`SceneSeries`] — the paired frame row and object
 /// row together — onto `w`. The full time-driven replay player is #22.
 ///
+/// Validation here is **local to the targeted epoch** (the frame row via astrodyn's streaming
+/// validators `validate_header`/`validate_uid_table`/`validate_record` + the parent guard, the
+/// object row's orphan/finiteness/shape checks, and the paired-row simtime match) — *not* a
+/// whole-series pass. So stepping a player through every epoch is O(total rows), not O(rows²). A
+/// caller wanting the whole-series guarantees (constant-topology segments, complete rows, full
+/// congruence) calls [`SceneSeries::validate`] **once** up front; this still re-checks enough per
+/// row to apply it safely and loudly.
+///
 /// # Errors
-/// [`ApplyError::Scene`] if the series is invalid/misaligned, [`ApplyError::NoSuchEpoch`] if the
-/// index is out of range, [`ApplyError::DanglingParent`] on a dangling parent.
+/// [`ApplyError::NoSuchEpoch`] if `(segment, epoch)` is out of range; [`ApplyError::Scene`] for a
+/// frame/object/row-alignment violation; [`ApplyError::DanglingParent`] on a dangling parent.
 pub fn apply_scene_series_epoch(
     series: &SceneSeries,
     segment: usize,
     epoch: usize,
     w: &mut SceneWriter,
 ) -> Result<(), ApplyError> {
-    series.validate()?;
+    // Header + uid table: the keyframe handshake, O(uids) — cheap to re-affirm per row.
+    validate_header(&series.frames.header).map_err(SceneError::Frames)?;
+    validate_uid_table(&series.frames.uids).map_err(SceneError::Frames)?;
+
     let frow = series
         .frames
         .segments
         .get(segment)
         .and_then(|s| s.epochs.get(epoch))
         .ok_or(ApplyError::NoSuchEpoch)?;
-    // validate() proved the timelines are congruent, so the object row exists too.
+    // The paired object row must exist and share this row's simtime — local congruence only.
     let orow = series
         .objects
         .get(segment)
         .and_then(|s| s.epochs.get(epoch))
-        .expect("object epoch present (congruent by validate())");
+        .ok_or(SceneError::SeriesMisaligned {
+            segment,
+            epoch: Some(epoch),
+            why: "no object row paired with this frame epoch",
+        })?;
+    if orow.simtime.to_bits() != frow.simtime.to_bits() {
+        return Err(SceneError::SeriesMisaligned {
+            segment,
+            epoch: Some(epoch),
+            why: "epoch simtime differs",
+        }
+        .into());
+    }
+
+    // Per-record frame validation (the streaming surface, astrodyn #680) + the parent guard.
+    let len = series.frames.uids.len();
+    for (i, rec) in frow.records.iter().enumerate() {
+        validate_record(rec, i, len).map_err(SceneError::Frames)?;
+    }
     check_parents(&series.frames.uids, &frow.records)?;
+    // Objects against this row's placed frames.
+    let placed = placed_frames(len, &frow.records);
+    validate_objects(len, &placed, &orow.objects)?;
+
     let mut tx = w.begin(tx_epoch(&frow.records));
     stage_records(&mut tx, &series.frames.uids, &frow.records);
     stage_objects(&mut tx, &series.frames.uids, &orow.objects);
@@ -829,18 +863,19 @@ mod tests {
     }
 
     #[test]
-    fn series_misalignment_rejected() {
-        // (a) epoch-count mismatch: drop one object epoch.
+    fn series_per_epoch_apply_rejects_misaligned_target_locally() {
+        // Per-epoch apply validates only the targeted epoch (O(row), not whole series).
+        // (a) the paired object epoch is missing → applying it is rejected.
         let mut s = base_series();
-        s.objects[0].epochs.pop();
+        s.objects[0].epochs.pop(); // object segment now has only epoch 0
         let err =
-            apply_scene_series_epoch(&s, 0, 0, &mut SceneStore::new().writer("wire")).unwrap_err();
+            apply_scene_series_epoch(&s, 0, 1, &mut SceneStore::new().writer("wire")).unwrap_err();
         assert!(matches!(
             err,
-            ApplyError::Scene(SceneError::SeriesMisaligned { .. })
+            ApplyError::Scene(SceneError::SeriesMisaligned { epoch: Some(1), .. })
         ));
 
-        // (b) simtime bit-mismatch at epoch 1.
+        // (b) simtime bit-mismatch at the targeted epoch → rejected, nothing committed.
         let mut s = base_series();
         s.objects[0].epochs[1].simtime = 1.5;
         let store = SceneStore::new();
@@ -851,7 +886,7 @@ mod tests {
         ));
         assert!(store.snapshot().is_empty());
 
-        // (c) segment-count mismatch.
+        // (c) the whole object segment is missing → rejected.
         let mut s = base_series();
         s.objects.clear();
         let err =
@@ -860,6 +895,27 @@ mod tests {
             err,
             ApplyError::Scene(SceneError::SeriesMisaligned { .. })
         ));
+    }
+
+    #[test]
+    fn whole_series_validate_catches_congruence_upfront() {
+        // The one-shot guarantee a player runs once before stepping: SceneSeries::validate()
+        // catches timeline incongruence that an aligned per-epoch apply wouldn't notice.
+        let mut s = base_series();
+        s.objects[0].epochs.pop(); // epoch counts differ
+        assert!(matches!(
+            s.validate(),
+            Err(SceneError::SeriesMisaligned { .. })
+        ));
+
+        let mut s = base_series();
+        s.objects.clear(); // segment counts differ
+        assert!(matches!(
+            s.validate(),
+            Err(SceneError::SeriesMisaligned { .. })
+        ));
+
+        assert!(base_series().validate().is_ok());
     }
 
     #[test]

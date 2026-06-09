@@ -35,7 +35,7 @@ use astrotui_core::scene::{
     BodyShape, BodyState, Epoch, ObjectKind, ObjectMeta, SceneStore, SceneWriter,
 };
 use astrotui_render_braille::BrailleRenderer;
-use astrotui_wire::Replay;
+use astrotui_wire::{Replay, ReplayError};
 use glam::DVec3;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -231,8 +231,12 @@ fn main() -> io::Result<()> {
 /// Load a recorded replay and play it in the TUI at wall-clock-controlled sim time. The viz
 /// outlives the recording: past the last cue the final snapshot simply stays on screen (§4).
 fn run_replay(path: &str) -> io::Result<()> {
-    let replay = Replay::from_json_path(path)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    // Preserve the original error: a file `Io` error keeps its kind (e.g. `NotFound`); decode/
+    // validation errors become an `io::Error` carrying the `ReplayError` as their source.
+    let replay = Replay::from_json_path(path).map_err(|e| match e {
+        ReplayError::Io(io) => io,
+        other => io::Error::other(other),
+    })?;
     let store = SceneStore::new();
     let mut terminal = ratatui::init();
     let result = run_replay_loop(&mut terminal, &replay, &store);
@@ -249,11 +253,12 @@ fn run_replay_loop(
     let begun = Instant::now();
     loop {
         let t = replay_sim_time(start, begun.elapsed().as_secs_f64());
-        // The series is pre-validated at load, so per-epoch apply does not fail; surface it
-        // loudly if it ever does rather than rendering a stale/half scene.
+        // Per-epoch apply re-validates the targeted row, incl. the dangling-parent guard that
+        // whole-series `validate()` does not run — so it *can* still fail on a bad row. Surface
+        // it loudly (the error becomes the `io::Error` source) rather than rendering a half scene.
         replay
             .apply_at(t, &mut store.writer("replay"))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            .map_err(io::Error::other)?;
         terminal.draw(|frame| {
             let area = frame.area();
             render_scene(store, area, frame.buffer_mut());
@@ -414,9 +419,12 @@ mod tests {
 
     #[test]
     fn replay_sim_time_offsets_and_scales() {
-        // 1× playback: sim time = recording start + elapsed wall seconds.
+        // 1× playback: sim time = recording start + elapsed wall seconds (concrete literals, so
+        // a change to PLAYBACK_SPEED or the formula actually fails this).
+        assert_eq!(PLAYBACK_SPEED, 1.0);
         assert_eq!(replay_sim_time(100.0, 0.0), 100.0);
-        assert_eq!(replay_sim_time(100.0, 2.5), 100.0 + 2.5 * PLAYBACK_SPEED);
+        assert_eq!(replay_sim_time(100.0, 2.5), 102.5);
+        assert_eq!(replay_sim_time(0.0, 10.0), 10.0);
     }
 
     #[test]

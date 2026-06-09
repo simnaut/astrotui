@@ -84,6 +84,10 @@ impl Replay {
                 });
             }
         }
+        // `cue_at_time` binary-searches by `simtime`, so the timeline must be time-ordered.
+        // A recording's segments are sequential in time, but don't rely on that — sort
+        // (stably, so equal-simtime cues keep play order). `total_cmp` is finite-safe.
+        timeline.sort_by(|a, b| a.simtime.total_cmp(&b.simtime));
         Ok(Self { series, timeline })
     }
 
@@ -176,7 +180,7 @@ mod tests {
         CanonicalRotation, Conventions, DocHeader, FrameRecord, Origin, SeriesBuilder, TransRecord,
         SCHEMA_VERSION,
     };
-    use astrodyn_quantities::{FrameUid, Moon, PlanetFixed, RootInertial};
+    use astrodyn_quantities::{FrameUid, Mars, Moon, PlanetFixed, RootInertial};
     use astrotui_core::scene::SceneStore;
     use glam::DVec3;
 
@@ -321,6 +325,71 @@ mod tests {
         let bytes = Json.encode(&s).unwrap();
         let err = Replay::from_json_slice(&bytes).unwrap_err();
         assert!(matches!(err, ReplayError::Invalid(_)));
+    }
+
+    // A 3-epoch replay split into TWO segments by a topology change (childB reparents from
+    // root to childA at t=2), so the timeline spans a segment boundary.
+    fn two_segment_series() -> SceneSeries {
+        let a = FrameUid::of::<PlanetFixed<Moon>>();
+        let b = FrameUid::of::<PlanetFixed<Mars>>();
+        let mut bld = SeriesBuilder::new(header(), vec![root_uid(), a, b.clone()]);
+        let row = |t: f64, b_parent: u32| {
+            vec![
+                frec(0, None, t, 0.0),
+                frec(1, Some(0), t, 0.0),
+                frec(2, Some(b_parent), t, 0.0),
+            ]
+        };
+        bld.push_epoch(0.0, row(0.0, 0)); // childB under root
+        bld.push_epoch(1.0, row(1.0, 0));
+        bld.push_epoch(2.0, row(2.0, 1)); // childB under childA → new segment
+        let frames = bld.finish();
+        let objects = vec![
+            ObjectSegment {
+                start_simtime: 0.0,
+                epochs: vec![
+                    ObjectEpochRow {
+                        simtime: 0.0,
+                        objects: vec![],
+                    },
+                    ObjectEpochRow {
+                        simtime: 1.0,
+                        objects: vec![],
+                    },
+                ],
+            },
+            ObjectSegment {
+                start_simtime: 2.0,
+                epochs: vec![ObjectEpochRow {
+                    simtime: 2.0,
+                    objects: vec![],
+                }],
+            },
+        ];
+        SceneSeries { frames, objects }
+    }
+
+    #[test]
+    fn seeks_across_a_segment_boundary() {
+        let r = Replay::new(two_segment_series()).unwrap();
+        assert_eq!(r.len(), 3); // 2 + 1 epochs flattened
+        assert_eq!(r.time_bounds(), Some((0.0, 2.0)));
+        assert_eq!(r.cue_at_time(1.5), Some(1)); // last cue of segment 0
+        assert_eq!(r.cue_at_time(2.0), Some(2)); // first cue of segment 1
+
+        // Applying the cross-boundary cue places childB under childA (the reparented topology).
+        let store = SceneStore::new();
+        assert_eq!(
+            r.apply_at(2.0, &mut store.writer("replay")).unwrap(),
+            Some(2)
+        );
+        let snap = store.snapshot();
+        let child_b = snap
+            .frames()
+            .iter()
+            .find(|f| f.uid == FrameUid::of::<PlanetFixed<Mars>>())
+            .unwrap();
+        assert_eq!(child_b.parent, Some(FrameUid::of::<PlanetFixed<Moon>>()));
     }
 
     #[test]

@@ -19,5 +19,10 @@ astrodyn_quantities = { workspace = true }
 ratatui = { workspace = true }
 glam = "0.30"
 
+[dev-dependencies]
+# The `record_demo` example + the replay-asset test build a SceneSeries directly, which needs
+# astrodyn_frame_doc's builder types (SeriesBuilder/FrameRecord/…) that astrotui-wire wraps.
+astrodyn_frame_doc = { workspace = true }
+
 [lints]
 workspace = true

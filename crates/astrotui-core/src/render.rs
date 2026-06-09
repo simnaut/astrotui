@@ -9,13 +9,13 @@
 //!    (§4.4 step 2), letting astrodyn do the frame math,
 //! 3. applies that transform to every object in the frame
 //!    (`pos_cam = origin + R_{F→cam} · p`), and
-//! 4. orthographically projects each camera-frame position to a terminal cell.
+//! 4. **perspective**-projects each camera-frame position from the dollied eye to a terminal
+//!    cell (a [`LogZoom`] log-distance along the view axis, #18).
 //!
-//! Drawing those cells is the renderer's job (#15). Perspective + seamless log-zoom +
-//! angular-size LOD arrive in P1; frame *orientation* (rotating frames, `DQuat`→JEOD quat)
-//! wires in with the Moon path in P2. This skeleton handles translational frame placement
-//! with an orthographic camera — enough to validate camera=frame + projection on the
-//! `RootInertial` overview.
+//! Drawing those cells is the renderer's job (#15). Angular-size **LOD** (point → ellipsoid →
+//! DEM mesh) arrives in #19; frame *orientation* (rotating frames, `DQuat`→JEOD quat) wired in
+//! with #77. The projection is numerically safe across ~12 orders of magnitude because it works
+//! in **camera-relative** coordinates (DESIGN.md §4.4, §5.2).
 
 use std::collections::HashMap;
 
@@ -87,8 +87,7 @@ impl UpHint {
 
 /// A right-handed orthonormal camera basis, in the camera frame's coordinates: the eye looks
 /// along `forward`, `right` is screen-right, `up` is screen-up. `right × up == -forward` — the
-/// eye looks down its own −Z, matching [`project_orthographic`]'s screen convention, so the
-/// projection and the basis agree once #18 wires the view transform in.
+/// eye looks down its own −Z, the screen convention [`project_perspective`] uses.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewBasis {
     /// Screen-right (unit).
@@ -126,10 +125,83 @@ fn orthonormal_view(forward: DVec3, up_hint: DVec3) -> ViewBasis {
     }
 }
 
+/// A **log-distance dolly**: the eye sits [`distance`](Self::distance) metres back from the view
+/// anchor along the view axis (DESIGN.md §3/§4.4/§5.2). Stored as `log10(distance)` so equal
+/// [`nudge`](Self::nudge)s are equal *screen* steps across the ~12 orders of magnitude between
+/// interplanetary cruise and a lunar touchdown — a linear store would crowd every near scale into
+/// the bottom ULPs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LogZoom {
+    /// log10 of the eye→anchor distance in metres.
+    log10_distance: f64,
+}
+
+impl LogZoom {
+    /// A dolly `metres` from the anchor. A non-finite or non-positive distance clamps to the
+    /// smallest positive dolly so the eye never coincides with the anchor (which would collapse
+    /// the view); express a *degenerate* view via the target/forward path, not a zero distance.
+    #[must_use]
+    pub fn from_distance(metres: f64) -> Self {
+        let m = if metres.is_finite() && metres > 0.0 {
+            metres
+        } else {
+            f64::MIN_POSITIVE
+        };
+        Self {
+            log10_distance: m.log10(),
+        }
+    }
+
+    /// Construct directly from `log10(distance)` (non-finite → [`Default`]).
+    #[must_use]
+    pub fn from_log10(x: f64) -> Self {
+        if x.is_finite() {
+            Self { log10_distance: x }
+        } else {
+            Self::default()
+        }
+    }
+
+    /// Eye→anchor distance in metres (= `10^log10`), always finite and `> 0`.
+    #[must_use]
+    pub fn distance(&self) -> f64 {
+        10f64.powf(self.log10_distance)
+    }
+
+    /// `log10` of the distance — the raw dolly parameter (for UI sliders / smooth interpolation).
+    #[must_use]
+    pub fn log10(&self) -> f64 {
+        self.log10_distance
+    }
+
+    /// Dolly by `decades` (+ moves the eye away, − moves it closer). Smooth zoom is a constant
+    /// rate of change in this parameter — the seamlessness the single-camera model needs.
+    #[must_use]
+    pub fn nudge(self, decades: f64) -> Self {
+        Self::from_log10(self.log10_distance + decades)
+    }
+}
+
+impl Default for LogZoom {
+    /// 1e7 m (10 000 km) — a near-orbit vantage that frames a planet-sized body.
+    fn default() -> Self {
+        Self {
+            log10_distance: 7.0,
+        }
+    }
+}
+
+/// Default full vertical field of view (radians) — 40°.
+const DEFAULT_FOV_RAD: f64 = 0.698_131_7;
+
+/// Near-plane distance (m): objects at or behind it are culled (a non-positive depth would flip
+/// the perspective divide and alias to the wrong side).
+const NEAR_PLANE_M: f64 = 1.0;
+
 /// The eye. A scene frame to sit in (astrodyn #659 identity), a [`CameraTarget`] view axis, an
-/// [`UpHint`], and an orthographic scale. Seamless **log-zoom** replaces the raw `scale` in #18
-/// and angular-size **LOD** arrives in #19; the frame/target/up model here is the stable base
-/// they build on (DESIGN.md §3 preset table, §4.4).
+/// [`UpHint`], a [`LogZoom`] log-distance dolly, and a field of view. One **seamless log-zoom
+/// perspective camera** spanning ~12 orders of magnitude (DESIGN.md §3/§4.4/§5.2); angular-size
+/// **LOD** arrives in #19. The frame/target/up model (#17) is the base it builds on.
 #[derive(Clone, Debug)]
 pub struct Camera {
     /// Identity of the scene frame the eye sits in / is oriented by (astrodyn #659).
@@ -138,64 +210,68 @@ pub struct Camera {
     pub target: CameraTarget,
     /// Which way is up when building the view basis.
     pub up: UpHint,
-    /// Orthographic scale: metres per terminal cell. Replaced by log-zoom in #18.
-    pub scale: f64,
+    /// Log-distance dolly of the eye along the view axis.
+    pub zoom: LogZoom,
+    /// Full vertical field of view, radians.
+    pub fov: f64,
 }
 
 impl Camera {
     /// A scene overview anchored in the frame named by `frame` (e.g.
-    /// `FrameUid::of::<RootInertial>()`), looking at that frame's origin with frame-up, at
-    /// `metres_per_cell` orthographic scale. The general-frame form of [`Camera::solar_overview`].
+    /// `FrameUid::of::<RootInertial>()`), looking at that frame's origin with frame-up, at the
+    /// default dolly + field of view. The general-frame form of [`Camera::solar_overview`]; tune
+    /// the view by setting the public `zoom`/`fov` fields.
     #[must_use]
-    pub fn overview(frame: FrameUid, metres_per_cell: f64) -> Self {
-        Self::in_frame(frame, metres_per_cell)
+    pub fn overview(frame: FrameUid) -> Self {
+        Self::in_frame(frame)
     }
 
-    /// Common preset body: sit in `frame`, look at its origin, frame-up, orthographic `scale`.
-    fn in_frame(frame: FrameUid, scale: f64) -> Self {
+    /// Common preset body: sit in `frame`, look at its origin, frame-up, default dolly + fov.
+    fn in_frame(frame: FrameUid) -> Self {
         Self {
             target: CameraTarget::FrameOrigin(frame.clone()),
             frame,
             up: UpHint::FrameUp,
-            scale,
+            zoom: LogZoom::default(),
+            fov: DEFAULT_FOV_RAD,
         }
     }
 
     /// **Solar-system overview** — the inertial root (`RootInertial`). Earth→Jupiter cruise.
     #[must_use]
-    pub fn solar_overview(scale: f64) -> Self {
-        Self::in_frame(FrameUid::of::<RootInertial>(), scale)
+    pub fn solar_overview() -> Self {
+        Self::in_frame(FrameUid::of::<RootInertial>())
     }
 
     /// **Inertial chase** — a planet's non-rotating inertial frame (`PlanetInertial<P>`). Orbits.
     #[must_use]
-    pub fn inertial_chase<P: Planet>(scale: f64) -> Self {
-        Self::in_frame(FrameUid::of::<PlanetInertial<P>>(), scale)
+    pub fn inertial_chase<P: Planet>() -> Self {
+        Self::in_frame(FrameUid::of::<PlanetInertial<P>>())
     }
 
     /// **Body-fixed** — a planet's rotating body-fixed frame (`PlanetFixed<P>`). Ground track,
     /// lunar approach.
     #[must_use]
-    pub fn body_fixed<P: Planet>(scale: f64) -> Self {
-        Self::in_frame(FrameUid::of::<PlanetFixed<P>>(), scale)
+    pub fn body_fixed<P: Planet>() -> Self {
+        Self::in_frame(FrameUid::of::<PlanetFixed<P>>())
     }
 
     /// **Orbit-relative** — a chief vehicle's LVLH frame (`Lvlh<V>`). Nadir / ram-pointed.
     #[must_use]
-    pub fn orbit_relative<V: Vehicle>(scale: f64) -> Self {
-        Self::in_frame(FrameUid::of::<Lvlh<V>>(), scale)
+    pub fn orbit_relative<V: Vehicle>() -> Self {
+        Self::in_frame(FrameUid::of::<Lvlh<V>>())
     }
 
     /// **Vehicle local NED** — a moving vehicle's north-east-down frame (`Ned<V>`).
     #[must_use]
-    pub fn vehicle_ned<V: Vehicle>(scale: f64) -> Self {
-        Self::in_frame(FrameUid::of::<Ned<V>>(), scale)
+    pub fn vehicle_ned<V: Vehicle>() -> Self {
+        Self::in_frame(FrameUid::of::<Ned<V>>())
     }
 
     /// **Onboard** — a vehicle's body frame (`BodyFrame<V>`). Cockpit / sensor boresight.
     #[must_use]
-    pub fn onboard<V: Vehicle>(scale: f64) -> Self {
-        Self::in_frame(FrameUid::of::<BodyFrame<V>>(), scale)
+    pub fn onboard<V: Vehicle>() -> Self {
+        Self::in_frame(FrameUid::of::<BodyFrame<V>>())
     }
 
     /// **Local horizon** — a site-anchored topocentric (ENU) frame on planet `P` (landing site,
@@ -206,8 +282,8 @@ impl Camera {
     /// so they converge byte-for-byte. `site` is a stable site key (e.g. `"KSC-LC39A"`); the
     /// geodetic anchor itself rides the frame's transform in the scene, not the identity.
     #[must_use]
-    pub fn local_horizon<P: Planet>(site: &str, scale: f64) -> Self {
-        Self::in_frame(topocentric_site_frame_uid(P::NAME, site), scale)
+    pub fn local_horizon<P: Planet>(site: &str) -> Self {
+        Self::in_frame(topocentric_site_frame_uid(P::NAME, site))
     }
 
     /// Build the orthonormal [`ViewBasis`] for a resolved `forward` view axis (in camera-frame
@@ -238,9 +314,10 @@ pub struct ProjectedPoint {
     pub row: f64,
     /// Position in the camera frame (metres) — retained for depth ordering / LOD later.
     pub pos_cam: DVec3,
-    /// The object's body axes expressed in **camera coordinates** (body → camera), composed
-    /// from the frame→camera rotation and the object's attitude. Identity until a producer
-    /// supplies attitude; consumed by oriented-ellipsoid LOD in P1/P2.
+    /// The object's body axes expressed in **camera-frame** coordinates (body → camera frame),
+    /// composed from the frame→camera rotation and the object's attitude. NOT screen/view space —
+    /// the view rotation (the [`ViewBasis`]) is applied to positions only; a consumer wanting
+    /// object→view composes it itself. Consumed by oriented-ellipsoid LOD in P1/P2.
     pub att_cam: DMat3,
 }
 
@@ -279,7 +356,14 @@ pub fn project_points(
     camera: &Camera,
     area: Rect,
 ) -> (Vec<ProjectedPoint>, RenderReport) {
-    if camera.scale <= 0.0 || area.width == 0 || area.height == 0 {
+    // The lens must be a sane angle and there must be a canvas. (`tan(fov/2)` finite & > 0 rules
+    // out a degenerate or ≥180° fov.)
+    let tan_half = (camera.fov * 0.5).tan();
+    // A sane lens (0 < fov < π ⇒ tan(fov/2) finite & > 0) and a non-empty canvas.
+    if !(camera.fov > 0.0 && camera.fov < std::f64::consts::PI && tan_half.is_finite())
+        || area.width == 0
+        || area.height == 0
+    {
         return (Vec::new(), RenderReport::default());
     }
     let (built, dropped_frames) = build_tree(snap);
@@ -296,12 +380,12 @@ pub fn project_points(
         return (Vec::new(), report);
     };
 
-    // Resolve ONE transform per occupied frame and apply it to every object in that frame
-    // (DESIGN.md §4.4 step 2). `compute_relative_state(cam, F)` gives F's origin in camera
-    // coordinates and the camera→F rotation; transposing that rotation maps an object's
-    // in-frame position `p` into camera coordinates: pos_cam = origin + R_{F→cam} · p.
+    // Pass 1 — frame composition (DESIGN.md §4.4 step 2), unchanged: resolve ONE transform per
+    // occupied frame and every object's `pos_cam`/`att_cam` (camera-FRAME coordinates).
+    // `compute_relative_state(cam, F)` gives F's origin in camera coords + the camera→F rotation;
+    // transposing maps an in-frame position `p` to camera coords: pos_cam = origin + R_{F→cam}·p.
     let mut by_frame: HashMap<usize, (DVec3, DMat3)> = HashMap::new();
-    let mut out = Vec::with_capacity(snap.objects().len());
+    let mut pending: Vec<(ObjectId, DVec3, DMat3)> = Vec::with_capacity(snap.objects().len());
     for obj in snap.objects() {
         let Some(&frame_id) = ids.get(&obj.frame) else {
             report.orphan_objects.push(obj.id.clone());
@@ -312,16 +396,47 @@ pub fn project_points(
             (s.trans.position, s.rot.t_parent_this.transpose())
         });
         let pos_cam = origin + r_frame_to_cam * obj.state.position;
-        // Object body axes in camera coordinates: (frame→cam) ∘ (body→frame). The attitude is
-        // the object's body orientation in its native frame (parent→this), so the transpose of
-        // its parent→this matrix is body→frame.
+        // Object body axes in camera coords: (frame→cam) ∘ (body→frame). The attitude is the
+        // body orientation in its native frame (parent→this), so the transpose of its
+        // parent→this matrix is body→frame.
         let body_to_frame = JeodQuat::from_glam(obj.state.attitude)
             .left_quat_to_transformation()
             .transpose();
         let att_cam = r_frame_to_cam * body_to_frame;
-        if let Some((col, row)) = project_orthographic(pos_cam, camera.scale, area) {
+        pending.push((obj.id.clone(), pos_cam, att_cam));
+    }
+
+    // Resolve the view anchor + axis in camera coords (DESIGN.md §4.4 step 4). The target sets
+    // what the eye looks at; the eye then dollies back along the view axis by `zoom.distance()`.
+    let look_at_cam: Option<DVec3> = match &camera.target {
+        CameraTarget::Bearing(_) => None,
+        // The target frame's origin in camera coords (ZERO when it's the camera's own frame).
+        CameraTarget::FrameOrigin(uid) => ids.get(uid).copied().map(|fid| {
+            by_frame
+                .entry(fid)
+                .or_insert_with(|| {
+                    let s = tree.compute_relative_state(cam_id, fid);
+                    (s.trans.position, s.rot.t_parent_this.transpose())
+                })
+                .0
+        }),
+        CameraTarget::Object(id) => pending.iter().find(|(i, ..)| i == id).map(|&(_, p, _)| p),
+    };
+    // `−Z` fallback (the established orthographic look axis) when the target can't form a
+    // direction — e.g. a camera on its own frame origin (`look_at = ZERO`). Only `Bearing(ZERO)`
+    // stays genuinely degenerate (and `forward` then yields `None` → `−Z` here too, harmless).
+    let forward = camera.target.forward(look_at_cam).unwrap_or(DVec3::NEG_Z);
+    let anchor = look_at_cam.unwrap_or(DVec3::ZERO);
+    let view = camera.view_basis(forward);
+    let eye = anchor - forward * camera.zoom.distance();
+
+    // Pass 2 — perspective-project each object's pos_cam from the dollied eye.
+    let (w, h) = (f64::from(area.width), f64::from(area.height));
+    let mut out = Vec::with_capacity(pending.len());
+    for (id, pos_cam, att_cam) in pending {
+        if let Some((col, row)) = project_perspective(pos_cam, eye, &view, tan_half, w, h) {
             out.push(ProjectedPoint {
-                id: obj.id.clone(),
+                id,
                 col,
                 row,
                 pos_cam,
@@ -415,23 +530,42 @@ fn frame_state(s: &BodyState) -> RefFrameState {
     }
 }
 
-/// Orthographic projection of a camera-frame position onto the viewport: the eye looks
-/// down −Z, screen +x is camera +x (right), screen +y is camera +y (up). Returns
-/// **fractional** cell coordinates (so a backend can rasterize at sub-cell resolution), or
-/// `None` if the point falls outside `area`. One cell spans `metres_per_cell` on both axes;
-/// cell aspect (terminal cells ≈ 2:1) is a backend concern.
-fn project_orthographic(pos_cam: DVec3, metres_per_cell: f64, area: Rect) -> Option<(f64, f64)> {
-    // Coordinates are LOCAL to the area: (0, 0) is the area's top-left, independent of
-    // where the area sits in the buffer — the renderer adds the area offset when it writes.
-    let col = f64::from(area.width) / 2.0 + pos_cam.x / metres_per_cell;
-    let row = f64::from(area.height) / 2.0 - pos_cam.y / metres_per_cell; // +y up → rows down
+/// Perspective-project a camera-frame position from the dollied `eye` looking along
+/// `view.forward`, with `tan_half = tan(fov/2)`. Returns **fractional** cell coordinates local to
+/// the area (so a backend can rasterize at sub-cell resolution), or `None` if the point is at/
+/// behind the near plane, non-finite, or off-area.
+///
+/// **Numerically safe across ~12 orders of magnitude** (DESIGN.md §4.4/§5.2): `rel = pos_cam −
+/// eye` is the difference of two *camera-relative* vectors (both from `compute_relative_state`
+/// against the camera frame), so no absolute heliocentric magnitudes are ever differenced —
+/// `rel` stays small near the eye even when the dolly distance is ~1e11 m. **Square-cell /
+/// aspect-agnostic**: one screen half-*width* of world spans the projection plane at unit depth
+/// on both axes, so terminal cell aspect (≈ 2:1) stays a backend concern.
+fn project_perspective(
+    pos_cam: DVec3,
+    eye: DVec3,
+    view: &ViewBasis,
+    tan_half: f64,
+    w: f64,
+    h: f64,
+) -> Option<(f64, f64)> {
+    let rel = pos_cam - eye; // camera-relative — small by construction
+    let depth = rel.dot(view.forward);
+    if depth <= NEAR_PLANE_M {
+        return None; // at/behind the eye → cull (a non-positive divide would flip sides)
+    }
+    let x = rel.dot(view.right);
+    let y = rel.dot(view.up);
+    let half = w / 2.0;
+    // Coordinates are LOCAL to the area: (0, 0) is the area's top-left.
+    let col = half + (x / (depth * tan_half)) * half;
+    let row = h / 2.0 - (y / (depth * tan_half)) * half; // +y up → rows down
 
-    // Cull non-finite coordinates first: a NaN/∞ would slip through the bounds check below
-    // (every comparison with NaN is false).
+    // Cull non-finite first: a NaN/∞ would slip through the bounds check below.
     if !col.is_finite() || !row.is_finite() {
         return None;
     }
-    if col < 0.0 || col >= f64::from(area.width) || row < 0.0 || row >= f64::from(area.height) {
+    if col < 0.0 || col >= w || row < 0.0 || row >= h {
         return None;
     }
     Some((col, row))
@@ -448,9 +582,9 @@ pub trait Renderer {
     fn draw_points(&self, points: &[(f64, f64)], area: Rect, buf: &mut Buffer);
 }
 
-/// The astrotui widget: projects a [`SceneStore`]'s latest snapshot through `camera` and
-/// rasterizes it with `renderer`. The renderer is injected so the host picks the backend
-/// (capability-based auto-detect arrives in P3); camera presets + log-zoom arrive in P1.
+/// The astrotui widget: projects a [`SceneStore`]'s latest snapshot through `camera` (perspective
+/// + log-zoom) and rasterizes it with `renderer`. The renderer is injected so the host picks the
+/// backend (capability-based auto-detect arrives in P3).
 pub struct SpaceView<'a> {
     camera: &'a Camera,
     renderer: &'a dyn Renderer,
@@ -506,6 +640,12 @@ mod tests {
         FrameUid::of::<PlanetFixed<Mars>>()
     }
 
+    fn at3(x: f64, y: f64, z: f64) -> BodyState {
+        BodyState {
+            position: DVec3::new(x, y, z),
+            ..BodyState::default()
+        }
+    }
     // Build a one-frame (root) scene with the given objects, then snapshot it.
     fn scene(objects: &[(&str, BodyState)]) -> std::sync::Arc<crate::scene::Snapshot> {
         let store = SceneStore::new();
@@ -517,24 +657,52 @@ mod tests {
         tx.commit();
         store.snapshot()
     }
-
-    #[test]
-    fn projects_to_viewport_centre_and_offsets() {
-        let snap = scene(&[("origin", at(0.0, 0.0)), ("right", at(4.0, 0.0))]);
-        let cam = Camera::overview(root(), 2.0); // 2 m per cell
-        let (pts, _) = project_points(&snap, &cam, area());
-
-        let origin = pts.iter().find(|p| p.id.as_str() == "origin").unwrap();
-        assert_eq!((origin.col, origin.row), (10.0, 5.0)); // centre of the 20x10 area
-        let right = pts.iter().find(|p| p.id.as_str() == "right").unwrap();
-        assert_eq!((right.col, right.row), (12.0, 5.0)); // +4 m / 2 m-per-cell = +2 cells in +x
+    // A perspective camera in `frame` with **+Y up** (so screen right=+X, up=+Y — avoids the
+    // top-down gimbal of the default frame-up), the eye dollied `dist` m back along −Z, default
+    // 40° fov. `tan(fov/2) = tan(20°) ≈ 0.363970`, so an object `x` m off-axis at depth `dist`
+    // projects to `col = w/2 + (x/(dist·tan20°))·(w/2)`.
+    fn persp(frame: FrameUid, dist: f64) -> Camera {
+        Camera {
+            up: UpHint::Direction(DVec3::Y),
+            zoom: LogZoom::from_distance(dist),
+            ..Camera::overview(frame)
+        }
     }
 
     #[test]
-    fn projection_is_local_to_the_area_offset() {
+    fn log_zoom_round_trips_and_nudges_by_decades() {
+        assert!((LogZoom::from_distance(1e7).distance() - 1e7).abs() < 1.0);
+        assert_eq!(LogZoom::default().distance(), 1e7);
+        // A +1-decade nudge multiplies the distance by 10.
+        let z = LogZoom::from_distance(1000.0);
+        assert!((z.nudge(1.0).distance() - 10_000.0).abs() < 1e-6);
+        assert!((z.nudge(-1.0).distance() - 100.0).abs() < 1e-9);
+        assert!((z.log10() - 3.0).abs() < 1e-12);
+        // Non-finite / non-positive distance clamps to a finite positive dolly (never zero).
+        assert!(LogZoom::from_distance(0.0).distance() > 0.0);
+        assert!(LogZoom::from_distance(-5.0).distance() > 0.0);
+        assert!(LogZoom::from_distance(f64::NAN).distance().is_finite());
+        assert_eq!(LogZoom::from_log10(f64::INFINITY), LogZoom::default());
+    }
+
+    #[test]
+    fn projects_to_viewport_centre_and_perspective_offset() {
+        let snap = scene(&[("origin", at(0.0, 0.0)), ("right", at(100.0, 0.0))]);
+        let (pts, _) = project_points(&snap, &persp(root(), 1000.0), area());
+
+        let origin = pts.iter().find(|p| p.id.as_str() == "origin").unwrap();
+        assert_eq!((origin.col, origin.row), (10.0, 5.0)); // on-axis → screen centre
+        let right = pts.iter().find(|p| p.id.as_str() == "right").unwrap();
+        // col = 10 + (100/(1000·tan20°))·10 = 12.747477… ; row stays centred (y = 0).
+        assert!((right.col - 12.747_477_4).abs() < 1e-5, "got {}", right.col);
+        assert_eq!(right.row, 5.0);
+    }
+
+    #[test]
+    fn on_axis_object_is_centred_regardless_of_area_offset() {
         // The same object projects to the same LOCAL (col, row) wherever the area sits.
         let snap = scene(&[("o", at(0.0, 0.0))]);
-        let cam = Camera::overview(root(), 1.0);
+        let cam = persp(root(), 1000.0);
         let (p0, _) = project_points(&snap, &cam, Rect::new(0, 0, 20, 10));
         let (p1, _) = project_points(&snap, &cam, Rect::new(7, 3, 20, 10));
         assert_eq!((p0[0].col, p0[0].row), (10.0, 5.0));
@@ -552,25 +720,128 @@ mod tests {
         tx.commit();
         let snap = store.snapshot();
 
-        // From the root camera, the probe sits at 105 m in x.
-        let (pts, _) = project_points(
-            &snap,
-            &Camera::overview(root(), 1.0),
-            Rect::new(0, 0, 400, 10),
-        );
+        // From the root camera, the probe sits at 105 m in x (frame composition — unchanged).
+        let (pts, _) = project_points(&snap, &persp(root(), 1000.0), Rect::new(0, 0, 400, 10));
         let probe = pts.iter().find(|p| p.id.as_str() == "probe").unwrap();
         assert_eq!(probe.pos_cam.x, 105.0);
-        assert_eq!((probe.col, probe.row), (305.0, 5.0)); // centre 200 + 105 m
+        // col = 200 + (105/(1000·tan20°))·200 = 257.6970…
+        assert!((probe.col - 257.697_026).abs() < 1e-3, "got {}", probe.col);
+        assert_eq!(probe.row, 5.0);
 
         // From a camera riding the child frame, the same probe is only 5 m in x.
-        let (pts, _) = project_points(
-            &snap,
-            &Camera::overview(child(), 1.0),
-            Rect::new(0, 0, 40, 10),
-        );
+        let (pts, _) = project_points(&snap, &persp(child(), 1000.0), Rect::new(0, 0, 40, 10));
         let probe = pts.iter().find(|p| p.id.as_str() == "probe").unwrap();
         assert_eq!(probe.pos_cam.x, 5.0);
-        assert_eq!((probe.col, probe.row), (25.0, 5.0)); // centre 20 + 5 m
+        // col = 20 + (5/(1000·tan20°))·20 = 20.274748…
+        assert!((probe.col - 20.274_748).abs() < 1e-5, "got {}", probe.col);
+        assert_eq!(probe.row, 5.0);
+    }
+
+    #[test]
+    fn dolly_shrinks_apparent_offset_as_the_eye_pulls_back() {
+        // Same off-axis object; a farther dolly makes it converge toward centre (the parallax
+        // the log-zoom is about). Near eye: large offset; far eye: ~centred.
+        let snap = scene(&[("p", at(100.0, 0.0))]);
+        let (near, _) = project_points(&snap, &persp(root(), 1_000.0), area());
+        let (far, _) = project_points(&snap, &persp(root(), 1_000_000.0), area());
+        let near_off = near[0].col - 10.0;
+        let far_off = far[0].col - 10.0;
+        assert!((near_off - 2.747_477_4).abs() < 1e-5);
+        assert!(
+            far_off > 0.0 && far_off < 0.01,
+            "far ~centre, got {far_off}"
+        );
+        assert!(near_off > far_off * 100.0); // ~1000× the offset at 1000× nearer
+    }
+
+    #[test]
+    fn perspective_parallax_depth_divide() {
+        // Two objects at equal x but different depth: the nearer one is more off-centre (the
+        // 1/depth divide that distinguishes perspective from the old orthographic map).
+        let snap = scene(&[
+            ("near", at3(100.0, 0.0, 0.0)),
+            ("far", at3(100.0, 0.0, -500.0)),
+        ]);
+        let (pts, _) = project_points(&snap, &persp(root(), 1000.0), area());
+        let near = pts.iter().find(|p| p.id.as_str() == "near").unwrap();
+        let far = pts.iter().find(|p| p.id.as_str() == "far").unwrap();
+        // near depth = 1000, far depth = 1500 (eye at z=+1000 looking −Z).
+        assert!(near.col > far.col && far.col > 10.0);
+    }
+
+    #[test]
+    fn near_plane_culls_objects_at_or_behind_the_eye() {
+        // Eye at z = +1000 looking −Z. An object on the far (+z) side is behind the eye → culled;
+        // one in front survives.
+        let snap = scene(&[
+            ("front", at3(0.0, 0.0, 0.0)),
+            ("behind", at3(0.0, 0.0, 2000.0)),
+        ]);
+        let (pts, _) = project_points(&snap, &persp(root(), 1000.0), area());
+        let ids: Vec<&str> = pts.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["front"]);
+    }
+
+    #[test]
+    fn wider_fov_moves_objects_toward_centre() {
+        let snap = scene(&[("p", at(100.0, 0.0))]);
+        let narrow = persp(root(), 1000.0); // 40°
+        let wide = Camera {
+            fov: 80f64.to_radians(),
+            ..persp(root(), 1000.0)
+        };
+        let (n, _) = project_points(&snap, &narrow, area());
+        let (w, _) = project_points(&snap, &wide, area());
+        assert!((n[0].col - 10.0) > (w[0].col - 10.0) && (w[0].col - 10.0) > 0.0);
+    }
+
+    #[test]
+    fn numerically_safe_across_many_orders_of_magnitude() {
+        // A ~1e11 m (AU-scale) object and a ~50 m object in one pass, eye dollied 1e6 m back:
+        // both project to finite, sane coordinates — camera-relative coords never difference two
+        // huge absolute positions.
+        let snap = scene(&[("near", at(50.0, 0.0)), ("far", at3(0.0, 0.0, -1.5e11))]);
+        let (pts, _) = project_points(&snap, &persp(root(), 1_000_000.0), area());
+        for p in &pts {
+            assert!(p.col.is_finite() && p.row.is_finite());
+        }
+        // Both are on-axis-ish → near screen centre; neither is NaN/∞.
+        assert!(pts.iter().any(|p| p.id.as_str() == "near"));
+        assert!(pts.iter().any(|p| p.id.as_str() == "far"));
+    }
+
+    #[test]
+    fn tracked_object_target_recentres_on_it() {
+        // target = Object("a"); `a` is off-axis but, being the look-at anchor, projects to centre.
+        // `b` is off the view axis (offset in z, which becomes screen-right here), so it's
+        // off-centre relative to `a`.
+        let snap = scene(&[("a", at(100.0, 0.0)), ("b", at3(100.0, 0.0, 50.0))]);
+        let cam = Camera {
+            target: CameraTarget::Object("a".into()),
+            up: UpHint::Direction(DVec3::Y),
+            zoom: LogZoom::from_distance(1000.0),
+            ..Camera::overview(root())
+        };
+        let (pts, _) = project_points(&snap, &cam, area());
+        let a = pts.iter().find(|p| p.id.as_str() == "a").unwrap();
+        assert_eq!((a.col, a.row), (10.0, 5.0)); // the tracked object is centred
+        let b = pts.iter().find(|p| p.id.as_str() == "b").unwrap();
+        assert!(b.col > 10.0); // the other object is off-centre relative to it
+    }
+
+    #[test]
+    fn bearing_target_sets_the_view_axis() {
+        // target = Bearing(+X): the eye looks along +X; an object along +X is centred.
+        let snap = scene(&[("ahead", at(100.0, 0.0))]);
+        let cam = Camera {
+            target: CameraTarget::Bearing(DVec3::X),
+            up: UpHint::Direction(DVec3::Z),
+            zoom: LogZoom::from_distance(1000.0),
+            ..Camera::overview(root())
+        };
+        let (pts, _) = project_points(&snap, &cam, area());
+        let ahead = pts.iter().find(|p| p.id.as_str() == "ahead").unwrap();
+        assert_eq!((ahead.col, ahead.row), (10.0, 5.0));
     }
 
     #[test]
@@ -585,11 +856,7 @@ mod tests {
         tx.commit();
         let snap = store.snapshot();
 
-        let (pts, _) = project_points(
-            &snap,
-            &Camera::overview(root(), 1.0),
-            Rect::new(0, 0, 400, 10),
-        );
+        let (pts, _) = project_points(&snap, &persp(root(), 1000.0), Rect::new(0, 0, 400, 10));
         let nose = pts.iter().find(|p| p.id.as_str() == "nose").unwrap();
         let tail = pts.iter().find(|p| p.id.as_str() == "tail").unwrap();
         assert_eq!(nose.pos_cam.x, 101.0); // 100 (frame) + 1 (in-frame)
@@ -615,7 +882,7 @@ mod tests {
                 },
             ),
         ]);
-        let (pts, _) = project_points(&snap, &Camera::overview(root(), 1.0), area());
+        let (pts, _) = project_points(&snap, &persp(root(), 1000.0), area());
         let ids: Vec<&str> = pts.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["ok"]); // NaN/∞ objects are dropped, not mapped to (0,0)
     }
@@ -623,7 +890,7 @@ mod tests {
     #[test]
     fn offscreen_objects_are_culled() {
         let snap = scene(&[("near", at(0.0, 0.0)), ("far", at(1_000.0, 0.0))]);
-        let (pts, _) = project_points(&snap, &Camera::overview(root(), 1.0), area());
+        let (pts, _) = project_points(&snap, &persp(root(), 1000.0), area());
         let ids: Vec<&str> = pts.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["near"]); // "far" is off the 20-wide viewport
     }
@@ -633,7 +900,7 @@ mod tests {
         let snap = scene(&[("a", at(0.0, 0.0))]);
         // `absent` is a valid identity that is simply not present in this scene: nothing
         // renders, and that is surfaced (not a silent blank screen).
-        let (pts, report) = project_points(&snap, &Camera::overview(absent(), 1.0), area());
+        let (pts, report) = project_points(&snap, &Camera::overview(absent()), area());
         assert!(pts.is_empty());
         assert_eq!(report.unresolved_camera_frame, Some(absent()));
         assert!(!report.is_clean());
@@ -641,15 +908,17 @@ mod tests {
 
     #[test]
     fn degenerate_inputs_yield_nothing() {
+        // A degenerate lens (fov = 0) draws nothing.
         let snap = scene(&[("a", at(0.0, 0.0))]);
-        assert!(
-            project_points(&snap, &Camera::overview(root(), 0.0), area())
-                .0
-                .is_empty()
-        );
+        let bad_fov = Camera {
+            fov: 0.0,
+            ..Camera::overview(root())
+        };
+        assert!(project_points(&snap, &bad_fov, area()).0.is_empty());
+        // An empty scene is not an error.
         let empty = SceneStore::new().snapshot();
-        let (pts, report) = project_points(&empty, &Camera::overview(root(), 1.0), area());
-        assert!(pts.is_empty() && report.is_clean()); // empty scene: nothing wrong
+        let (pts, report) = project_points(&empty, &Camera::overview(root()), area());
+        assert!(pts.is_empty() && report.is_clean());
     }
 
     #[test]
@@ -664,8 +933,7 @@ mod tests {
             ObjectMeta::default(),
         );
         tx.commit();
-        let (pts, report) =
-            project_points(&store.snapshot(), &Camera::overview(root(), 1.0), area());
+        let (pts, report) = project_points(&store.snapshot(), &Camera::overview(root()), area());
         assert!(pts.is_empty());
         let orphans: Vec<&str> = report.orphan_objects.iter().map(|o| o.as_str()).collect();
         assert_eq!(orphans, ["ghost"]);
@@ -681,8 +949,7 @@ mod tests {
             .frame(child(), Some(absent()), at(1.0, 0.0))
             .object("here", root(), at(0.0, 0.0), ObjectMeta::default());
         tx.commit();
-        let (_pts, report) =
-            project_points(&store.snapshot(), &Camera::overview(root(), 1.0), area());
+        let (_pts, report) = project_points(&store.snapshot(), &Camera::overview(root()), area());
         assert_eq!(report.dropped_frames, vec![child()]);
     }
 
@@ -706,25 +973,25 @@ mod tests {
     fn presets_name_the_expected_frames_with_default_target_and_up() {
         use astrodyn_quantities::{BodyFrame, Lvlh, Ned, PlanetInertial};
         let cases = [
-            (Camera::solar_overview(1.0), FrameUid::of::<RootInertial>()),
+            (Camera::solar_overview(), FrameUid::of::<RootInertial>()),
             (
-                Camera::inertial_chase::<Moon>(1.0),
+                Camera::inertial_chase::<Moon>(),
                 FrameUid::of::<PlanetInertial<Moon>>(),
             ),
             (
-                Camera::body_fixed::<Moon>(1.0),
+                Camera::body_fixed::<Moon>(),
                 FrameUid::of::<PlanetFixed<Moon>>(),
             ),
             (
-                Camera::orbit_relative::<TestProbe>(1.0),
+                Camera::orbit_relative::<TestProbe>(),
                 FrameUid::of::<Lvlh<TestProbe>>(),
             ),
             (
-                Camera::vehicle_ned::<TestProbe>(1.0),
+                Camera::vehicle_ned::<TestProbe>(),
                 FrameUid::of::<Ned<TestProbe>>(),
             ),
             (
-                Camera::onboard::<TestProbe>(1.0),
+                Camera::onboard::<TestProbe>(),
                 FrameUid::of::<BodyFrame<TestProbe>>(),
             ),
         ];
@@ -736,8 +1003,8 @@ mod tests {
         }
         // Distinct planets / vehicles yield distinct identities (tag carries the parameter).
         assert_ne!(
-            Camera::body_fixed::<Moon>(1.0).frame,
-            Camera::body_fixed::<Mars>(1.0).frame
+            Camera::body_fixed::<Moon>().frame,
+            Camera::body_fixed::<Mars>().frame
         );
     }
 
@@ -745,19 +1012,16 @@ mod tests {
     fn local_horizon_sites_have_distinct_value_keyed_identities() {
         // The whole point of astrodyn #688/#696: two sites on one planet must NOT collide, and a
         // given (planet, site) is stable (so a producer and the viz converge on one FrameUid).
-        let a = Camera::local_horizon::<Moon>("shackleton", 1.0);
-        let b = Camera::local_horizon::<Moon>("malapert", 1.0);
+        let a = Camera::local_horizon::<Moon>("shackleton");
+        let b = Camera::local_horizon::<Moon>("malapert");
         assert_ne!(a.frame, b.frame, "two lunar sites must not alias");
         assert_eq!(
             a.frame,
-            Camera::local_horizon::<Moon>("shackleton", 2.0).frame,
+            Camera::local_horizon::<Moon>("shackleton").frame,
             "same (planet, site) is stable across calls"
         );
         // Same site key on a different planet is still distinct.
-        assert_ne!(
-            a.frame,
-            Camera::local_horizon::<Mars>("shackleton", 1.0).frame
-        );
+        assert_ne!(a.frame, Camera::local_horizon::<Mars>("shackleton").frame);
         // It is a Topocentric identity, and a site uid is NOT the planet-only typed uid.
         assert_eq!(a.frame.class, astrodyn_quantities::FrameClass::Topocentric);
         assert_ne!(
@@ -771,11 +1035,11 @@ mod tests {
 
     #[test]
     fn view_basis_matches_projection_convention() {
-        // Eye looks down −Z with +Y up → +X right, +Y up — the axes project_orthographic
-        // assumes (the view transform that consumes this lands in #18).
+        // Eye looks down −Z with +Y up → +X right, +Y up — the screen axes the perspective
+        // projector ([`project_perspective`]) uses.
         let cam = Camera {
             up: UpHint::Direction(DVec3::Y),
-            ..Camera::overview(root(), 1.0)
+            ..Camera::overview(root())
         };
         let b = cam.view_basis(DVec3::NEG_Z);
         assert!(approx(b.forward, DVec3::NEG_Z));
@@ -789,8 +1053,8 @@ mod tests {
     fn default_frame_up_is_z_so_top_down_is_the_gimbal_case() {
         // The default up is the frame's +Z; looking straight down (−Z) is then up ∥ forward —
         // a genuine top-down ambiguity. The guard must still yield an orthonormal basis.
-        let b = Camera::overview(root(), 1.0).view_basis(DVec3::NEG_Z);
-        assert_eq!(Camera::overview(root(), 1.0).up, UpHint::FrameUp);
+        let b = Camera::overview(root()).view_basis(DVec3::NEG_Z);
+        assert_eq!(Camera::overview(root()).up, UpHint::FrameUp);
         assert!(approx(b.forward, DVec3::NEG_Z));
         for v in [b.right, b.up, b.forward] {
             assert!((v.length() - 1.0).abs() < 1e-12);
@@ -803,7 +1067,7 @@ mod tests {
     fn view_basis_is_orthonormal_for_an_oblique_axis() {
         let cam = Camera {
             up: UpHint::Direction(DVec3::new(0.0, 1.0, 0.2)),
-            ..Camera::overview(root(), 1.0)
+            ..Camera::overview(root())
         };
         let b = cam.view_basis(DVec3::new(1.0, 2.0, -3.0));
         for v in [b.right, b.up, b.forward] {
@@ -820,7 +1084,7 @@ mod tests {
         // up ∥ forward would collapse the basis; the guard must still return an orthonormal one.
         let cam = Camera {
             up: UpHint::Direction(DVec3::Z),
-            ..Camera::overview(root(), 1.0)
+            ..Camera::overview(root())
         };
         let b = cam.view_basis(DVec3::Z); // forward == up
         assert!(approx(b.forward, DVec3::Z));
@@ -834,7 +1098,7 @@ mod tests {
         // forward ∥ +X (and up ∥ forward) takes the `f.x.abs() >= 0.9` branch → alternate up Y.
         let cam = Camera {
             up: UpHint::Direction(DVec3::X),
-            ..Camera::overview(root(), 1.0)
+            ..Camera::overview(root())
         };
         let b = cam.view_basis(DVec3::X); // forward == up == +X
         assert!(approx(b.forward, DVec3::X));
@@ -850,7 +1114,7 @@ mod tests {
     fn view_basis_zero_forward_falls_back_to_minus_z() {
         let cam = Camera {
             up: UpHint::Direction(DVec3::Y),
-            ..Camera::overview(root(), 1.0)
+            ..Camera::overview(root())
         };
         let b = cam.view_basis(DVec3::ZERO);
         assert!(approx(b.forward, DVec3::NEG_Z)); // degenerate axis → frame look axis
@@ -886,10 +1150,10 @@ mod tests {
         let mut tx = store.writer("p").begin(Epoch::from_seconds(0.0));
         tx.frame(root(), None, BodyState::default())
             .object("origin", root(), at(0.0, 0.0), ObjectMeta::default())
-            .object("right", root(), at(4.0, 0.0), ObjectMeta::default());
+            .object("right", root(), at(100.0, 0.0), ObjectMeta::default());
         tx.commit();
 
-        let cam = Camera::overview(root(), 2.0);
+        let cam = persp(root(), 1000.0);
         let recorder = Recorder::default();
         let a = area();
         let mut buf = Buffer::empty(a);
@@ -897,6 +1161,8 @@ mod tests {
 
         let mut got = recorder.0.into_inner();
         got.sort_by(|x, y| x.0.total_cmp(&y.0));
-        assert_eq!(got, vec![(10.0, 5.0), (12.0, 5.0)]); // same projection as project_points
+        // Same projection as project_points: origin at centre, "right" off-centre per perspective.
+        assert_eq!(got[0], (10.0, 5.0));
+        assert!((got[1].0 - 12.747_477_4).abs() < 1e-5 && got[1].1 == 5.0);
     }
 }

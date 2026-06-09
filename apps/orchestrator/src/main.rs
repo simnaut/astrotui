@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use astrodyn_planet::{PlanetShape, EARTH, MOON, SUN};
 use astrodyn_quantities::{FrameUid, RootInertial};
 use astrotui_core::producer::Producer;
-use astrotui_core::render::Renderer;
+use astrotui_core::render::{project_points, Camera, LogZoom, Renderer, UpHint};
 use astrotui_core::scene::{
     BodyShape, BodyState, Epoch, ObjectKind, ObjectMeta, SceneStore, SceneWriter,
 };
@@ -94,15 +94,16 @@ impl Producer for DemoProducer {
         .object(
             "sun",
             root.clone(),
-            // 1 AU beyond Earth (+z, away from the camera), tilted toward screen-left.
-            point(axis_offset(EARTH_SUN_M, SUN_FRAMING_RAD, false)),
+            // 1 AU beyond Earth, on the −z side (in front of the eye, which sits at +z looking
+            // −Z in core's right-handed convention), tilted toward screen-left.
+            point(axis_offset(EARTH_SUN_M, SUN_FRAMING_RAD, true)),
             body("Sun", SUN),
         )
         .object(
             "moon",
             root,
-            // 384 400 km beyond Earth (+z, far side), tilted toward screen-right.
-            point(axis_offset(EARTH_MOON_M, MOON_FRAMING_RAD, false)),
+            // 384 400 km beyond Earth (−z, far side), tilted toward screen-right.
+            point(axis_offset(EARTH_MOON_M, MOON_FRAMING_RAD, true)),
             body("Moon", MOON),
         );
         tx.commit();
@@ -140,37 +141,54 @@ fn body(label: &'static str, shape: PlanetShape) -> ObjectMeta {
     }
 }
 
-/// Draw the scene into `buf` through the perspective camera. The camera sits at
-/// `−CAM_DISTANCE_M` on the root z-axis looking toward +z, so a world point's camera-frame
-/// position is just `position + (0, 0, CAM_DISTANCE_M)`. A body's on-screen radius is its true
-/// `r_eq` divided by the world width spanned by half the screen at that depth — so nearer
-/// bodies loom larger and the distant Sun shrinks. Off-screen dots are culled per-dot by the
-/// renderer.
+/// The core perspective camera that frames the demo (#18): anchored in the root frame, looking
+/// down −Z with +Y up, the eye dollied [`CAM_DISTANCE_M`] back, the field of view set so Earth
+/// spans [`EARTH_SCREEN_FRACTION`]. Earth is *framed* by where the eye sits, not resized.
+fn demo_camera() -> Camera {
+    Camera {
+        up: UpHint::Direction(DVec3::Y),
+        zoom: LogZoom::from_distance(CAM_DISTANCE_M),
+        // Core's fov is the full angle; the demo's `fov_half_tan` is `tan(fov/2)` (the horizontal
+        // half-angle that frames Earth under square cells).
+        fov: 2.0 * fov_half_tan().atan(),
+        ..Camera::overview(FrameUid::of::<RootInertial>())
+    }
+}
+
+/// Draw the scene into `buf`. Core's [`project_points`] does the camera=frame perspective
+/// projection (DESIGN §4.4); the demo only adds the angular-size disc rendering — a body's
+/// on-screen radius is its true `r_eq` over the world width spanned by half the screen at its
+/// depth, so nearer bodies loom larger and the distant Sun shrinks. (The point→disc LOD lands in
+/// core with #19, which will subsume this.)
 fn render_scene(store: &SceneStore, area: Rect, buf: &mut Buffer) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let snap = store.snapshot();
+    let camera = demo_camera();
+    let (points, _report) = project_points(&snap, &camera, area);
     let half_tan = fov_half_tan();
-    let (w, h) = (f64::from(area.width), f64::from(area.height));
+    let w = f64::from(area.width);
 
     let mut pts: Vec<(f64, f64)> = Vec::new();
-    for obj in snap.objects() {
-        let cam = obj.state.position + DVec3::new(0.0, 0.0, CAM_DISTANCE_M);
-        if cam.z <= 1.0 {
-            continue; // at or behind the camera
-        }
-        // World metres spanning half the viewport width at this depth.
-        let half_width_m = cam.z * half_tan;
-        let col = w / 2.0 + (cam.x / half_width_m) * (w / 2.0);
-        let row = h / 2.0 - (cam.y / half_width_m) * (w / 2.0) / CELL_ASPECT; // +y up
-        let radius = obj
-            .shape
-            .map_or(0.0, |s| s.ellipsoid.r_eq() / half_width_m * (w / 2.0));
-        if radius >= 0.75 {
-            fill_disc(&mut pts, col, row, radius);
+    for p in &points {
+        // Depth in front of the eye (at +z·CAM_DISTANCE_M looking −Z): (pos_cam − eye)·(−Z).
+        let depth = CAM_DISTANCE_M - p.pos_cam.z;
+        let r_eq = snap
+            .objects()
+            .iter()
+            .find(|o| o.id == p.id)
+            .and_then(|o| o.shape)
+            .map_or(0.0, |s| s.ellipsoid.r_eq());
+        let radius = if depth > 0.0 {
+            r_eq / (depth * half_tan) * (w / 2.0)
         } else {
-            pts.push((col, row));
+            0.0
+        };
+        if radius >= 0.75 {
+            fill_disc(&mut pts, p.col, p.row, radius);
+        } else {
+            pts.push((p.col, p.row));
         }
     }
     BrailleRenderer::new().draw_points(&pts, area, buf);

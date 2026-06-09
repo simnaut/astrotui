@@ -18,9 +18,14 @@
 //! projector here previews P1's perspective + seamless log-zoom (#18) and the angular-size
 //! point→disc LOD (#19), which will subsume it into the core `Renderer`. Press `q`/`Esc` to
 //! quit.
+//!
+//! **Replay mode** (#22, DESIGN §8(b)): `orchestrator --replay <file.json>` plays a recorded
+//! scene series ([`Replay`]) instead of the live demo, driving the `SceneWriter` at
+//! wall-clock-controlled sim time. The same widget/render path renders it; object positions are
+//! shown in their native frame (full frame-aware projection lands with #18).
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use astrodyn_planet::{PlanetShape, EARTH, MOON, SUN};
 use astrodyn_quantities::{FrameUid, RootInertial};
@@ -30,6 +35,7 @@ use astrotui_core::scene::{
     BodyShape, BodyState, Epoch, ObjectKind, ObjectMeta, SceneStore, SceneWriter,
 };
 use astrotui_render_braille::BrailleRenderer;
+use astrotui_wire::Replay;
 use glam::DVec3;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -190,12 +196,78 @@ fn fill_disc(pts: &mut Vec<(f64, f64)>, cx: f64, cy: f64, radius: f64) {
     }
 }
 
+/// Sim seconds advanced per real second of playback (1× — wall-clock time).
+const PLAYBACK_SPEED: f64 = 1.0;
+
+/// Map wall-clock `elapsed_secs` since playback began to a replay sim time, offset to the
+/// recording's `start_simtime` and scaled by [`PLAYBACK_SPEED`]. Pure — the loop's clock.
+fn replay_sim_time(start_simtime: f64, elapsed_secs: f64) -> f64 {
+    start_simtime + elapsed_secs * PLAYBACK_SPEED
+}
+
+/// The replay file path from `--replay <path>` in `args` (skipping argv[0]), if present.
+fn replay_arg(mut args: impl Iterator<Item = String>) -> Option<String> {
+    while let Some(a) = args.next() {
+        if a == "--replay" {
+            return args.next();
+        }
+    }
+    None
+}
+
 fn main() -> io::Result<()> {
-    let store = build_scene();
+    // `--replay <file>` plays a recorded scene series (DESIGN §8(b)); otherwise the live demo.
+    if let Some(path) = replay_arg(std::env::args().skip(1)) {
+        run_replay(&path)
+    } else {
+        let store = build_scene();
+        let mut terminal = ratatui::init();
+        let result = run(&mut terminal, &store);
+        ratatui::restore();
+        result
+    }
+}
+
+/// Load a recorded replay and play it in the TUI at wall-clock-controlled sim time. The viz
+/// outlives the recording: past the last cue the final snapshot simply stays on screen (§4).
+fn run_replay(path: &str) -> io::Result<()> {
+    let replay = Replay::from_json_path(path)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    let store = SceneStore::new();
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &store);
+    let result = run_replay_loop(&mut terminal, &replay, &store);
     ratatui::restore();
     result
+}
+
+fn run_replay_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    replay: &Replay,
+    store: &SceneStore,
+) -> io::Result<()> {
+    let start = replay.time_bounds().map_or(0.0, |(s, _)| s);
+    let begun = Instant::now();
+    loop {
+        let t = replay_sim_time(start, begun.elapsed().as_secs_f64());
+        // The series is pre-validated at load, so per-epoch apply does not fail; surface it
+        // loudly if it ever does rather than rendering a stale/half scene.
+        replay
+            .apply_at(t, &mut store.writer("replay"))
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            render_scene(store, area, frame.buffer_mut());
+        })?;
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press
+                    && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal, store: &SceneStore) -> io::Result<()> {
@@ -338,5 +410,20 @@ mod tests {
             lit.iter().any(|&x| x > 3 * area.width / 4),
             "Moon not visible on the right"
         );
+    }
+
+    #[test]
+    fn replay_sim_time_offsets_and_scales() {
+        // 1× playback: sim time = recording start + elapsed wall seconds.
+        assert_eq!(replay_sim_time(100.0, 0.0), 100.0);
+        assert_eq!(replay_sim_time(100.0, 2.5), 100.0 + 2.5 * PLAYBACK_SPEED);
+    }
+
+    #[test]
+    fn replay_arg_extracts_the_path() {
+        let got = replay_arg(["--replay", "descent.json"].iter().map(|s| s.to_string()));
+        assert_eq!(got.as_deref(), Some("descent.json"));
+        assert_eq!(replay_arg(["--replay"].iter().map(|s| s.to_string())), None); // missing value
+        assert_eq!(replay_arg(std::iter::empty()), None); // no flag → live demo
     }
 }

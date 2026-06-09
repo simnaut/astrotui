@@ -12,10 +12,12 @@
 
 pub mod codec;
 pub mod frame_doc;
+pub mod replay;
 pub mod scene_doc;
 
 pub use codec::{Json, WireCodec};
 pub use frame_doc::{apply_document, apply_series_epoch, ApplyError, DocumentProducer};
+pub use replay::{Replay, ReplayError};
 pub use scene_doc::{
     apply_scene_document, apply_scene_series_epoch, ObjectEpochRow, ObjectKindWire, ObjectRecord,
     ObjectSegment, SceneDocument, SceneDocumentProducer, SceneError, SceneSeries, ShapeRecord,

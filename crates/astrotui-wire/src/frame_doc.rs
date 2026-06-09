@@ -508,7 +508,7 @@ mod tests {
 
         let snap = store.snapshot();
         let area = Rect::new(0, 0, 400, 400);
-        let (pts, report) = project_points(&snap, &Camera::overview(root_uid(), 1.0), area);
+        let (pts, report) = project_points(&snap, &Camera::overview(root_uid()), area);
         assert!(
             report.is_clean(),
             "rotating-frame scene must resolve cleanly: {report:?}"

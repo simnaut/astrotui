@@ -136,27 +136,34 @@ pub struct LogZoom {
     log10_distance: f64,
 }
 
+/// `log10(distance)` is clamped to this band so [`LogZoom::distance`] is always finite and
+/// strictly positive: `10^±307` is comfortably inside `f64`'s finite, normal range. The band
+/// still spans 600+ orders of magnitude — far more than the ~12 the camera needs.
+const LOG_ZOOM_BOUND: f64 = 307.0;
+
 impl LogZoom {
     /// A dolly `metres` from the anchor. A non-finite or non-positive distance clamps to the
-    /// smallest positive dolly so the eye never coincides with the anchor (which would collapse
+    /// smallest in-band dolly so the eye never coincides with the anchor (which would collapse
     /// the view); express a *degenerate* view via the target/forward path, not a zero distance.
     #[must_use]
     pub fn from_distance(metres: f64) -> Self {
-        let m = if metres.is_finite() && metres > 0.0 {
-            metres
+        if metres.is_finite() && metres > 0.0 {
+            Self::from_log10(metres.log10())
         } else {
-            f64::MIN_POSITIVE
-        };
-        Self {
-            log10_distance: m.log10(),
+            Self {
+                log10_distance: -LOG_ZOOM_BOUND,
+            }
         }
     }
 
-    /// Construct directly from `log10(distance)` (non-finite → [`Default`]).
+    /// Construct directly from `log10(distance)`, **clamped** to `±`[`LOG_ZOOM_BOUND`] so
+    /// `distance()` can't overflow to `∞` (non-finite → [`Default`]).
     #[must_use]
     pub fn from_log10(x: f64) -> Self {
         if x.is_finite() {
-            Self { log10_distance: x }
+            Self {
+                log10_distance: x.clamp(-LOG_ZOOM_BOUND, LOG_ZOOM_BOUND),
+            }
         } else {
             Self::default()
         }
@@ -191,7 +198,7 @@ impl Default for LogZoom {
     }
 }
 
-/// Default full vertical field of view (radians) — 40°.
+/// Default full horizontal field of view (radians) — 40°.
 const DEFAULT_FOV_RAD: f64 = 0.698_131_7;
 
 /// Near-plane distance (m): objects at or behind it are culled (a non-positive depth would flip
@@ -212,7 +219,10 @@ pub struct Camera {
     pub up: UpHint,
     /// Log-distance dolly of the eye along the view axis.
     pub zoom: LogZoom,
-    /// Full vertical field of view, radians.
+    /// Full **horizontal** field of view, radians — the angle spanned across the viewport
+    /// **width**. Cells are square (`project_perspective` scales both axes by half the width), so
+    /// the vertical extent follows from the viewport's aspect; terminal cell aspect (≈ 2:1) stays
+    /// a backend concern (#19).
     pub fov: f64,
 }
 
@@ -582,9 +592,9 @@ pub trait Renderer {
     fn draw_points(&self, points: &[(f64, f64)], area: Rect, buf: &mut Buffer);
 }
 
-/// The astrotui widget: projects a [`SceneStore`]'s latest snapshot through `camera` (perspective
-/// + log-zoom) and rasterizes it with `renderer`. The renderer is injected so the host picks the
-/// backend (capability-based auto-detect arrives in P3).
+/// The astrotui widget: projects a [`SceneStore`]'s latest snapshot through `camera` (a
+/// log-zoom perspective camera) and rasterizes it with `renderer`. The renderer is injected so
+/// the host picks the backend (capability-based auto-detect arrives in P3).
 pub struct SpaceView<'a> {
     camera: &'a Camera,
     renderer: &'a dyn Renderer,
@@ -671,8 +681,9 @@ mod tests {
 
     #[test]
     fn log_zoom_round_trips_and_nudges_by_decades() {
+        // `powf` rounding varies by libm, so compare with a relative epsilon, never `==`.
         assert!((LogZoom::from_distance(1e7).distance() - 1e7).abs() < 1.0);
-        assert_eq!(LogZoom::default().distance(), 1e7);
+        assert!((LogZoom::default().distance() - 1e7).abs() < 1.0);
         // A +1-decade nudge multiplies the distance by 10.
         let z = LogZoom::from_distance(1000.0);
         assert!((z.nudge(1.0).distance() - 10_000.0).abs() < 1e-6);
@@ -683,6 +694,9 @@ mod tests {
         assert!(LogZoom::from_distance(-5.0).distance() > 0.0);
         assert!(LogZoom::from_distance(f64::NAN).distance().is_finite());
         assert_eq!(LogZoom::from_log10(f64::INFINITY), LogZoom::default());
+        // distance() stays finite even for an extreme exponent (the ±bound clamp).
+        assert!(LogZoom::from_log10(1e9).distance().is_finite());
+        assert!(LogZoom::from_log10(1e9).distance() > 0.0);
     }
 
     #[test]
@@ -797,17 +811,20 @@ mod tests {
 
     #[test]
     fn numerically_safe_across_many_orders_of_magnitude() {
-        // A ~1e11 m (AU-scale) object and a ~50 m object in one pass, eye dollied 1e6 m back:
-        // both project to finite, sane coordinates — camera-relative coords never difference two
-        // huge absolute positions.
-        let snap = scene(&[("near", at(50.0, 0.0)), ("far", at3(0.0, 0.0, -1.5e11))]);
-        let (pts, _) = project_points(&snap, &persp(root(), 1_000_000.0), area());
+        // Eye dollied 1e11 m (≈ 1 AU) back. A near 50 m object and a 1e9 m **off-axis** object
+        // both flow through the perspective divide at ~1e11 m depth → finite, *correct* coords
+        // (the off-axis term is non-zero, so this genuinely exercises the large-magnitude divide,
+        // not a trivial on-axis centre). Camera-relative coords never difference two huge
+        // absolute positions, so no NaN/∞.
+        let snap = scene(&[("near", at(50.0, 0.0)), ("far", at(1.0e9, 0.0))]);
+        let (pts, _) = project_points(&snap, &persp(root(), 1.0e11), area());
         for p in &pts {
             assert!(p.col.is_finite() && p.row.is_finite());
         }
-        // Both are on-axis-ish → near screen centre; neither is NaN/∞.
+        // col = 10 + (1e9/(1e11·tan20°))·10 = 10.274747… — the divide is correct at AU scale.
+        let far = pts.iter().find(|p| p.id.as_str() == "far").unwrap();
+        assert!((far.col - 10.274_747_7).abs() < 1e-4, "got {}", far.col);
         assert!(pts.iter().any(|p| p.id.as_str() == "near"));
-        assert!(pts.iter().any(|p| p.id.as_str() == "far"));
     }
 
     #[test]

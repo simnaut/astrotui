@@ -170,16 +170,18 @@ fn render_scene(store: &SceneStore, area: Rect, buf: &mut Buffer) {
     let half_tan = fov_half_tan();
     let w = f64::from(area.width);
 
+    // Equatorial radius per object id, so the per-point disc sizing below is O(1), not O(n).
+    let radii: std::collections::HashMap<_, f64> = snap
+        .objects()
+        .iter()
+        .filter_map(|o| o.shape.map(|s| (o.id.clone(), s.ellipsoid.r_eq())))
+        .collect();
+
     let mut pts: Vec<(f64, f64)> = Vec::new();
     for p in &points {
         // Depth in front of the eye (at +z·CAM_DISTANCE_M looking −Z): (pos_cam − eye)·(−Z).
         let depth = CAM_DISTANCE_M - p.pos_cam.z;
-        let r_eq = snap
-            .objects()
-            .iter()
-            .find(|o| o.id == p.id)
-            .and_then(|o| o.shape)
-            .map_or(0.0, |s| s.ellipsoid.r_eq());
+        let r_eq = radii.get(&p.id).copied().unwrap_or(0.0);
         let radius = if depth > 0.0 {
             r_eq / (depth * half_tan) * (w / 2.0)
         } else {

@@ -14,10 +14,10 @@
 //! smaller than the nearby Earth (~10% vs 40% of the width) because it is ~430× farther
 //! away; the Moon, beyond Earth and tiny, is smaller still (~5%).
 //!
-//! Core's projection is orthographic (DESIGN.md §4.4 skeleton); the small perspective
-//! projector here previews P1's perspective + seamless log-zoom (#18) and the angular-size
-//! point→disc LOD (#19), which will subsume it into the core `Renderer`. Press `q`/`Esc` to
-//! quit.
+//! Rendering goes entirely through the core pipeline now: perspective + log-zoom projection
+//! (#18) and the angular-size point→ellipsoid LOD (#19) live in `astrotui-core`, and the braille
+//! backend rasterizes the silhouettes — the orchestrator just builds the scene and the camera.
+//! Press `q`/`Esc` to quit.
 //!
 //! **Replay mode** (#22, DESIGN §8(b)): `orchestrator --replay <file.json>` plays a recorded
 //! scene series ([`Replay`]) instead of the live demo, driving the `SceneWriter` at
@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 use astrodyn_planet::{PlanetShape, EARTH, MOON, SUN};
 use astrodyn_quantities::{FrameUid, RootInertial};
 use astrotui_core::producer::Producer;
-use astrotui_core::render::{project_points, Camera, LogZoom, Renderer, UpHint};
+use astrotui_core::render::{
+    project_bodies, Camera, LodMemory, LogZoom, ProjectedBody, RenderBody, Renderer, UpHint,
+};
 use astrotui_core::scene::{
     BodyShape, BodyState, Epoch, ObjectKind, ObjectMeta, SceneStore, SceneWriter,
 };
@@ -41,8 +43,6 @@ use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::Rect;
 
-/// Terminal cells are roughly twice as tall as wide; correct for it so discs look round.
-const CELL_ASPECT: f64 = 2.0;
 /// How far the camera sits from Earth (m): 350 000 km — a close vantage, just inside the
 /// Moon's orbital radius, so Earth (the nearest body) looms large and the far-off Sun is
 /// small.
@@ -155,65 +155,18 @@ fn demo_camera() -> Camera {
     }
 }
 
-/// Draw the scene into `buf`. Core's [`project_points`] does the camera=frame perspective
-/// projection (DESIGN §4.4); the demo only adds the angular-size disc rendering — a body's
-/// on-screen radius is its true `r_eq` over the world width spanned by half the screen at its
-/// depth, so nearer bodies loom larger and the distant Sun shrinks. (The point→disc LOD lands in
-/// core with #19, which will subsume this.)
-fn render_scene(store: &SceneStore, area: Rect, buf: &mut Buffer) {
+/// Draw the scene into `buf` via core's **angular-size LOD** path (DESIGN §4.4/§5.2): core
+/// projects each body and chooses point vs filled-ellipse silhouette (with hysteresis carried in
+/// `lod` across frames), and the braille backend rasterizes it. `demo_camera` frames Earth at
+/// ~40% from ~3.5e8 m back, so Earth is a disc, the distant Sun smaller, the Moon smaller still.
+fn render_scene(store: &SceneStore, area: Rect, buf: &mut Buffer, lod: &mut LodMemory) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let snap = store.snapshot();
-    let camera = demo_camera();
-    let (points, _report) = project_points(&snap, &camera, area);
-    let half_tan = fov_half_tan();
-    let w = f64::from(area.width);
-
-    // Equatorial radius per object id, so the per-point disc sizing below is O(1), not O(n).
-    let radii: std::collections::HashMap<_, f64> = snap
-        .objects()
-        .iter()
-        .filter_map(|o| o.shape.map(|s| (o.id.clone(), s.ellipsoid.r_eq())))
-        .collect();
-
-    let mut pts: Vec<(f64, f64)> = Vec::new();
-    for p in &points {
-        // Depth in front of the eye (at +z·CAM_DISTANCE_M looking −Z): (pos_cam − eye)·(−Z).
-        let depth = CAM_DISTANCE_M - p.pos_cam.z;
-        let r_eq = radii.get(&p.id).copied().unwrap_or(0.0);
-        let radius = if depth > 0.0 {
-            r_eq / (depth * half_tan) * (w / 2.0)
-        } else {
-            0.0
-        };
-        if radius >= 0.75 {
-            fill_disc(&mut pts, p.col, p.row, radius);
-        } else {
-            pts.push((p.col, p.row));
-        }
-    }
-    BrailleRenderer::new().draw_points(&pts, area, buf);
-}
-
-/// Tessellate a filled disc of `radius` cells centred at `(cx, cy)` into braille-resolution
-/// points, aspect-corrected so it renders round. Samples every sub-cell dot (½ cell wide,
-/// ¼ cell tall).
-fn fill_disc(pts: &mut Vec<(f64, f64)>, cx: f64, cy: f64, radius: f64) {
-    let r_row = radius / CELL_ASPECT;
-    let mut col = cx - radius;
-    while col <= cx + radius {
-        let mut row = cy - r_row;
-        while row <= cy + r_row {
-            let dx = (col - cx) / radius;
-            let dy = (row - cy) / r_row;
-            if dx * dx + dy * dy <= 1.0 {
-                pts.push((col, row));
-            }
-            row += 0.25;
-        }
-        col += 0.5;
-    }
+    let (bodies, _report) = project_bodies(&snap, &demo_camera(), area, lod);
+    let render_bodies: Vec<RenderBody> = bodies.iter().map(ProjectedBody::to_render_body).collect();
+    BrailleRenderer::new().draw_bodies(&render_bodies, area, buf);
 }
 
 /// Sim seconds advanced per real second of playback (1× — wall-clock time).
@@ -271,6 +224,7 @@ fn run_replay_loop(
 ) -> io::Result<()> {
     let start = replay.time_bounds().map_or(0.0, |(s, _)| s);
     let begun = Instant::now();
+    let mut lod = LodMemory::new(); // cross-frame LOD hysteresis state
     loop {
         let t = replay_sim_time(start, begun.elapsed().as_secs_f64());
         // Per-epoch apply re-validates the targeted row, incl. the dangling-parent guard that
@@ -281,7 +235,7 @@ fn run_replay_loop(
             .map_err(io::Error::other)?;
         terminal.draw(|frame| {
             let area = frame.area();
-            render_scene(store, area, frame.buffer_mut());
+            render_scene(store, area, frame.buffer_mut(), &mut lod);
         })?;
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
@@ -296,10 +250,11 @@ fn run_replay_loop(
 }
 
 fn run(terminal: &mut ratatui::DefaultTerminal, store: &SceneStore) -> io::Result<()> {
+    let mut lod = LodMemory::new(); // cross-frame LOD hysteresis state
     loop {
         terminal.draw(|frame| {
             let area = frame.area();
-            render_scene(store, area, frame.buffer_mut());
+            render_scene(store, area, frame.buffer_mut(), &mut lod);
         })?;
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
@@ -365,7 +320,7 @@ mod tests {
         let store = build_scene();
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
-        render_scene(&store, area, &mut buf);
+        render_scene(&store, area, &mut buf, &mut LodMemory::new());
 
         // On the centre row, Earth's filled disc straddles the middle; measure its width.
         let mid = area.height / 2;
@@ -399,7 +354,7 @@ mod tests {
         let store = build_scene();
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
-        render_scene(&store, area, &mut buf);
+        render_scene(&store, area, &mut buf, &mut LodMemory::new());
         let mid = area.height / 2;
         let lit = lit_columns(&buf, area, mid);
         let centre = area.width / 2;
@@ -422,7 +377,7 @@ mod tests {
         let store = build_scene();
         let area = Rect::new(0, 0, 120, 40);
         let mut buf = Buffer::empty(area);
-        render_scene(&store, area, &mut buf);
+        render_scene(&store, area, &mut buf, &mut LodMemory::new());
         let mid = area.height / 2;
         let lit = lit_columns(&buf, area, mid);
         // Sun sits left of Earth, Moon right of it — and Earth (40% wide) stays inside the

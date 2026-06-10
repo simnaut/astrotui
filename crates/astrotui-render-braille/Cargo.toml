@@ -11,5 +11,10 @@ description = "Monochrome braille-dot rendering backend for astrotui (the capabi
 astrotui-core = { workspace = true }
 ratatui = { workspace = true }
 
+[dev-dependencies]
+# Golden-frame silhouette tests: `buffer_to_text` (core's `testing` feature) + insta snapshots.
+astrotui-core = { workspace = true, features = ["testing"] }
+insta = "1"
+
 [lints]
 workspace = true

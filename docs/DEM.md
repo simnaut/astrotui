@@ -199,7 +199,7 @@ LOLA polar products are the documented future path, §2).
   - **Levels 6–7, site window**: the one 512 ppd source tile containing the
     site (`SLDEM2015_512_00N_30N_000_045_FLOAT.IMG`, 30°×45°, 1.42 GB) —
     512 ppd **is** level 7, cut over the level-4 tile footprint that encloses
-    the NAC bbox (18–22°N, 28–32°E): 64 level-7 + 4 level-6 tiles ≈ 17 MiB.
+    the NAC bbox (18–22°N, 28–32°E): 64 level-7 + 16 level-6 tiles ≈ 20 MiB.
 - Where the NAC island has no data inside its bounding box (footprint is not
   a perfect rectangle), the prep tool fills from the level-7 base so every
   emitted tile is complete; tiles wholly outside coverage are simply not

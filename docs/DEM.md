@@ -90,7 +90,8 @@ orbit tracks), inheriting the ME frame through that control.
 **Decision: vertices are placed from radius, not ellipsoid-plus-height.**
 
 ```text
-r(lat, lon)      = 1737.4 km + h_tile(lat, lon)
+R_SPHERE          = 1_737_400.0 m                  (the LOLA reference radius)
+r(lat, lon)       = R_SPHERE + h_tile(lat, lon)    (h_tile in metres, §4.1)
 vertex (ME frame) = r · [cos(lat)·cos(lon), cos(lat)·sin(lon), sin(lat)]
 ```
 
@@ -137,15 +138,23 @@ offset  size  field
 30      8     lat_max      (f64)
 38      8     lon_min      (f64, degrees, 0–360 positive east)
 46      8     lon_max      (f64)
-54      8     height scale/offset reserved (f64 scale = 1.0; heights are metres)
+54      8     reserved f64 (write 0.0; earmarked for a future height scale)
 62      2     reserved (0)
-64      4     crc32 of the payload
-68      …     payload: samples² × f32 LE heights, row-major, north-to-south
+64      4     CRC-32 of the payload (IEEE/zlib variant: reflected poly
+              0xEDB88320, init 0xFFFFFFFF, final xor 0xFFFFFFFF)
+68      …     payload: samples² × f32 heights in metres, row-major,
+              north-to-south
 ```
 
-All integers little-endian. A 256×256 tile is 64 KiB of payload + 68-byte
-header ≈ **64.1 KiB per tile**. The header is fixed-size on purpose: a reader
-is `read_exact` + `f32::from_le_bytes`, no varints, no metadata blocks.
+**All multi-byte numeric fields — the integers, the `f64` bounds, and the
+`f32` payload — are little-endian.** The bounds are **tile-edge bounds,
+half-open `[min, max)`** (`lon_max = 360.0` permitted on the seam column);
+payload samples sit at **pixel centers** inside them — sample *(i, j)* is
+centered at `lat_max − (i+0.5)·Δ`, `lon_min + (j+0.5)·Δ` — which is what
+§7's neighbor-stitching rule relies on. A 256×256 tile is 256 KiB of payload
++ 68-byte header ≈ **256.1 KiB per tile**. The header is fixed-size on
+purpose: a reader is `read_exact` + `f32::from_le_bytes`, no varints, no
+metadata blocks.
 
 ### 4.2 Pyramid & indexing
 
@@ -179,7 +188,8 @@ LOLA polar products are the documented future path, §2).
   (equirectangular, 5 m posts, GeoTIFF) onto the level grids by bilinear
   resampling; level 11 is a mild oversample (3.7 m grid from 5 m posts),
   levels 8–10 are clean downsamples. The site island at level 11 is
-  ≈ 62 × 57 ≈ 3,500 tiles ≈ 220 MiB on disk; each lower level is ¼ that.
+  ≈ 62 × 57 ≈ 3,500 tiles ≈ 875 MiB on disk; each lower level is ¼ that
+  (levels 8–11 together ≈ 1.2 GB).
 - **Base tier (levels 4–7)** — SLDEM2015 FLOAT products store f32 **km**
   (`UNIT = KILOMETER`, `OFFSET = 1737.4`); prep converts to f32 metres.
   Two sources, both native-resolution matches for their levels:
@@ -189,13 +199,14 @@ LOLA polar products are the documented future path, §2).
   - **Levels 6–7, site window**: the one 512 ppd source tile containing the
     site (`SLDEM2015_512_00N_30N_000_045_FLOAT.IMG`, 30°×45°, 1.42 GB) —
     512 ppd **is** level 7, cut over the level-4 tile footprint that encloses
-    the NAC bbox (18–22°N, 28–32°E): 64 level-7 + 4 level-6 tiles ≈ 4.3 MiB.
+    the NAC bbox (18–22°N, 28–32°E): 64 level-7 + 4 level-6 tiles ≈ 17 MiB.
 - Where the NAC island has no data inside its bounding box (footprint is not
   a perfect rectangle), the prep tool fills from the level-7 base so every
   emitted tile is complete; tiles wholly outside coverage are simply not
   emitted (§4.2 sparse-pyramid fallback).
 - v1 manifest totals: ≈ 4.7 GB downloaded (two SLDEM files + the NAC
-  GeoTIFF), ≈ 3.8 GB emitted to the cache, dominated by global level 5.
+  GeoTIFF), ≈ 4.7 GB emitted to the cache (global level 5 ≈ 2.8 GB; the
+  NAC island levels 8–11 ≈ 1.2 GB).
 
 ## 5. Acquisition: fetched by a prep tool, never by the render path
 
@@ -219,11 +230,11 @@ the sim" posture.
 **Decision: one tiny real tile is committed**, plus synthetic tiles generated
 in test code.
 
-- **Committed real fixture** — a single native-format tile (§4.1, 64.1 KiB):
+- **Committed real fixture** — a single native-format tile (§4.1, 256.1 KiB):
   the level-7 tile containing the Apollo 17 LM site (20.19°N, 30.77°E),
   produced by `dem-prep` and checked in under
   `crates/astrotui-dem/tests/fixtures/`. This deliberately
-  amends the repo's no-binary-fixtures status quo: 64 KiB buys golden frames
+  amends the repo's no-binary-fixtures status quo: 256 KiB buys golden frames
   over *real* terrain (mesh + hillshade over an analytic cone would
   green-wash exactly the failure modes that matter — noise, slope
   distribution, datum offsets). Cap: fixtures stay ≤ 512 KiB total; anything
@@ -295,11 +306,11 @@ Per tile, in `astrotui-dem`:
 
 This is the number #28 cites.
 
-- Decoded tiles are 64 KiB heap each (§4.1) plus mesh/normal buffers ≈ 3 MiB
+- Decoded tiles are 256 KiB heap each (§4.1) plus mesh/normal buffers ≈ 3 MiB
   per *meshed* tile (256² verts × (3 pos + 3 normal) × f64; ≈ 1.5 MiB if
   Stage 1 goes f32 mesh-side, which it may).
 - **Budget: 256 MiB default, configurable**, covering decoded tiles + meshes:
-  ≈ 80 f64-meshed tiles (≈ 160 at f32). The §8 view-relative gate bounds the
+  ≈ 78 f64-meshed tiles (≈ 145 at f32). The §8 view-relative gate bounds the
   visible ground patch to ≈ distance × FOV, and one-post-per-dot level
   selection makes the meshed set scale with view area, not terrain area:
   a ~7×7 neighborhood at the selected level plus coarser surrounding rings —

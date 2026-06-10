@@ -502,7 +502,8 @@ lowest-risk part; the **DEM pipeline is the real new engineering** (§9, §11).
 2. **DEM → geometry (astrotui-dem).** DEM tiles store planetocentric radius
    offsets from the **1737.4 km LOLA reference sphere** — not heights above the
    `astrodyn_planet::MOON` ellipsoid — so vertices are placed directly from
-   radius: `(1737.4 km + h)·unit(lat, lon)` in `PlanetFixed<Moon>`
+   radius: `(1_737_400 m + h_m)·unit(lat, lon)`, all in metres, in
+   `PlanetFixed<Moon>`
    ([`DEM.md`](DEM.md) §3; the ellipsoid serves only the pre-DEM LOD stages).
    Those vertices live on the Moon-fixed node, so `compute_relative_state` to
    the camera renders them with no special-casing.

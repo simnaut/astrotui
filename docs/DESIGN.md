@@ -499,11 +499,14 @@ lowest-risk part; the **DEM pipeline is the real new engineering** (§9, §11).
    offset internally; no parallel ANISE Almanac, no hardcoded constant. astrotui
    just receives the resulting frame.
 
-2. **DEM → geometry (astrotui-dem).** DEM tiles (lat/lon/height over the lunar
-   mean radius) → Cartesian in `PlanetFixed<Moon>` using
-   `astrodyn_planet::MOON` (r_eq 1738.14 km, r_pol 1736.07 km) + height. Those
-   vertices live on the Moon-fixed node, so `compute_relative_state` to the camera
-   renders them with no special-casing.
+2. **DEM → geometry (astrotui-dem).** DEM tiles store planetocentric radius
+   offsets from the **1737.4 km LOLA reference sphere** — not heights above the
+   `astrodyn_planet::MOON` ellipsoid — so vertices are placed directly from
+   radius: `(1_737_400 m + h_m)·unit(lat, lon)`, all in metres, in
+   `PlanetFixed<Moon>`
+   ([`DEM.md`](DEM.md) §3; the ellipsoid serves only the pre-DEM LOD stages).
+   Those vertices live on the Moon-fixed node, so `compute_relative_state` to
+   the camera renders them with no special-casing.
 
 3. **Camera.** `Topocentric<Moon>` anchored at the target site (a child node under
    the Moon-fixed frame, declared by the producer) for the local-horizon descent
@@ -628,7 +631,7 @@ flowchart TD
 | **P0** | `SceneStore` + scoped `SceneWriter` + snapshot/double-buffer; braille backend; `RootInertial` overview; a trivial in-process producer feeding Earth/Moon/Sun points. *Validates camera=frame + projection + ingestion.* |
 | **P1** | Camera presets + seamless log-zoom + LOD (point → shaded ellipsoid); color-cell backend. *(Wire codec + replay reader **deferred** behind the in-process `Producer` trait — §4.1.)* |
 | **Pre-P2 hardening** *(added 2026-06-04; rescoped 2026-06-07 for astrodyn #659)* | Adopt `astrodyn_quantities::FrameUid` as the core frame identity (§3); consume `astrodyn_frame_doc` record types for the frame wire (§4.3); introduce the in-process `Producer` trait (§4.1); make unresolved frames + stale parents loud (§4.4); and the **integration test consuming a rotating-frame `FrameDocument` that gates P2** (§4.4). |
-| **P2** | Moon-landing slice: producer-supplied `MoonMeDe421` frame, `Topocentric<Moon>` camera, trail + path. **Blocked by the Pre-P2 rotating-frame integration test (§4.4).** **DEM via a dedicated design doc + staged build:** (1) one static pre-tiled site → mesh → shade end-to-end, (2) dynamic tiling/paging, (3) LOD + memory budget, (4) hillshade across all backends. |
+| **P2** | Moon-landing slice: producer-supplied `MoonMeDe421` frame, `Topocentric<Moon>` camera, trail + path. **Blocked by the Pre-P2 rotating-frame integration test (§4.4).** **DEM via a dedicated design doc ([`DEM.md`](DEM.md)) + staged build:** (1) one static pre-tiled site → mesh → shade end-to-end, (2) dynamic tiling/paging, (3) LOD + memory budget, (4) hillshade across all backends. |
 | **P3** | Separate-process sim + exporter; orchestrator spawn/observe lifecycle; telemetry listen + ephemeris body-filler layer; backend auto-detect. |
 | **P4** | Earth→Jupiter cruise scene, HUD, in-TUI frame/camera switcher driven by `scene.frames()`. |
 
@@ -636,8 +639,9 @@ flowchart TD
 
 ## 11. Open items
 
-- **DEM design doc** (LOLA vs SLDEM2015, tile scheme, on-disk vs fetched, LOD,
-  memory budget) — owned by `astrotui-dem`, gates P2 code.
+- **DEM design doc** — ~~open~~ **resolved: specified in [`DEM.md`](DEM.md)**
+  (SLDEM2015 base + LROC NAC site tier, native tile format + pyramid, prep-tool
+  acquisition, LOD thresholds, 256 MiB budget).
 - **Backpressure/coalescing policy** — when a producer outruns the TUI frame
   rate, ingestion processes every sample (so trails stay complete) while render
   reads the latest; the firehose fallback (coalesce, accept trail gaps) is a

@@ -1,0 +1,16 @@
+---
+source: crates/astrotui-render-color/src/lib.rs
+expression: "pixels_to_text(&buf, a)"
+---
+                  
+                  
+                  
+                  
+                  
+                  
+     =++=.        
+     +####+       
+     =#%%%#+      
+      +#%%%#=     
+       +####+     
+        .=++=

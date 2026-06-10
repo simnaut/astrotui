@@ -392,7 +392,13 @@ fn project_core(
     // The lens must be a sane angle and there must be a canvas. (`tan(fov/2)` finite & > 0 rules
     // out a degenerate or ≥180° fov.)
     let tan_half = (camera.fov * 0.5).tan();
-    if !(camera.fov > 0.0 && camera.fov < std::f64::consts::PI && tan_half.is_finite())
+    // A sane lens (0 < fov < π) whose `tan(fov/2)` is finite **and strictly positive** — an
+    // extreme-tiny fov could underflow `tan` to 0, and later `depth · tan_half` divisions would
+    // blow up to ∞ in the LOD sizing / rasterization.
+    if !(camera.fov > 0.0
+        && camera.fov < std::f64::consts::PI
+        && tan_half.is_finite()
+        && tan_half > 0.0)
         || area.width == 0
         || area.height == 0
     {
@@ -553,7 +559,7 @@ impl LodMemory {
     /// Drop ids not seen this frame, so a removed/culled body neither leaks memory nor resurrects
     /// a stale [`Lod`]. A body that briefly leaves the view loses its hysteresis state and
     /// re-seeds from the band midpoint on return — acceptable, as an off-screen body has no
-    /// current size to hysterese against.
+    /// current size to apply hysteresis against.
     fn retain_seen(&mut self, seen: &HashSet<ObjectId>) {
         self.prev.retain(|id, _| seen.contains(id));
     }
@@ -896,7 +902,7 @@ pub trait Renderer {
 
 /// The stateful render state a [`SpaceView`] mutates each frame: the scene store plus the
 /// cross-frame LOD hysteresis [`LodMemory`]. The memory lives here (not in the lock-free
-/// `SceneStore`) because it is per-view render state — two cameras of one scene hysterese
+/// `SceneStore`) because it is per-view render state — two cameras of one scene apply hysteresis
 /// independently — and `SpaceView` is rebuilt per frame so it cannot hold it itself.
 #[derive(Default)]
 pub struct ViewState {

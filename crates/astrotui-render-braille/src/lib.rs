@@ -94,16 +94,28 @@ fn fill_ellipse(
     tilt: f64,
 ) {
     let (cx, cy) = center;
-    if !(a > 0.0 && b > 0.0 && cx.is_finite() && cy.is_finite() && tilt.is_finite()) {
+    if !(a > 0.0
+        && b > 0.0
+        && a.is_finite()
+        && b.is_finite()
+        && cx.is_finite()
+        && cy.is_finite()
+        && tilt.is_finite())
+    {
         return;
     }
     let (sin_t, cos_t) = tilt.sin_cos();
     let rcol = a.max(b); // bounding half-extent in col cells
     let rrow = rcol / CELL_ASPECT;
-    let mut col = cx - rcol;
-    while col <= cx + rcol {
-        let mut row = cy - rrow;
-        while row <= cy + rrow {
+    // Clamp the sample box to the viewport: samples outside are dropped by `plot_dot` anyway, so
+    // this bounds the work to the visible area (a huge ellipse doesn't iterate millions of
+    // off-screen sub-cells — and would never terminate if a semi-axis were unbounded).
+    let col_hi = (cx + rcol).min(w as f64);
+    let row_hi = (cy + rrow).min(h as f64);
+    let mut col = (cx - rcol).max(0.0);
+    while col <= col_hi {
+        let mut row = (cy - rrow).max(0.0);
+        while row <= row_hi {
             let dx = col - cx;
             // Back to the square col-metric space (down +), then rotate the sample into the
             // ellipse's own axes and normalize by each semi-axis.
@@ -275,6 +287,33 @@ mod tests {
         };
         assert_eq!(lit(&render_bodies(&[point], a), a).len(), 1); // a point lights one cell
         assert!(lit(&render_bodies(&[disc], a), a).len() > 10); // a disc lights many
+    }
+
+    #[test]
+    fn fill_ellipse_huge_and_nonfinite_are_bounded() {
+        let a = Rect::new(0, 0, 20, 10);
+        // A huge ellipse fills the visible area without iterating its (enormous) full bbox.
+        let huge = RenderBody {
+            col: 10.0,
+            row: 5.0,
+            kind: RenderKind::Ellipsoid {
+                semi_major: 1.0e6,
+                semi_minor: 1.0e6,
+                tilt: 0.0,
+            },
+        };
+        assert!(lit(&render_bodies(&[huge], a), a).len() > 100);
+        // A non-finite semi-axis is rejected — no infinite loop, nothing drawn.
+        let inf = RenderBody {
+            col: 10.0,
+            row: 5.0,
+            kind: RenderKind::Ellipsoid {
+                semi_major: f64::INFINITY,
+                semi_minor: 4.0,
+                tilt: 0.0,
+            },
+        };
+        assert!(lit(&render_bodies(&[inf], a), a).is_empty());
     }
 
     #[test]

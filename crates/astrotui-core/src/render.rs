@@ -17,7 +17,7 @@
 //! with #77. The projection is numerically safe across ~12 orders of magnitude because it works
 //! in **camera-relative** coordinates (DESIGN.md §4.4, §5.2).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use astrodyn_frames::{FrameTree, RefFrameRot, RefFrameState, RefFrameTrans};
 use astrodyn_quantities::frame_identity::topocentric_site_frame_uid;
@@ -30,7 +30,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::StatefulWidget;
 
-use crate::scene::{BodyState, ObjectId, SceneStore, Snapshot};
+use crate::scene::{BodyShape, BodyState, ObjectId, SceneStore, Snapshot};
 
 /// Where the camera looks — resolved per render into a forward view axis in the camera frame's
 /// own coordinates (DESIGN.md §4.4). The frame sets origin + orientation; the *target* sets the
@@ -366,15 +366,37 @@ pub fn project_points(
     camera: &Camera,
     area: Rect,
 ) -> (Vec<ProjectedPoint>, RenderReport) {
+    let (points, report, _ctx) = project_core(snap, camera, area);
+    (points, report)
+}
+
+/// The view context the perspective pass resolved: the dollied `eye`, the screen `view` basis,
+/// `tan(fov/2)`, and the viewport half-width (cells). Shared between [`project_points`] and the
+/// LOD pass ([`project_bodies`]) so the angular-size + oblate-silhouette math reuses exactly the
+/// projector's geometry.
+struct ViewCtx {
+    eye: DVec3,
+    view: ViewBasis,
+    tan_half: f64,
+    half: f64,
+}
+
+/// The shared frame-composition + perspective projection (DESIGN.md §4.4). Returns the projected
+/// points, the [`RenderReport`], and the [`ViewCtx`] (`None` on a degenerate lens / empty canvas /
+/// unresolvable camera frame, where nothing projects).
+fn project_core(
+    snap: &Snapshot,
+    camera: &Camera,
+    area: Rect,
+) -> (Vec<ProjectedPoint>, RenderReport, Option<ViewCtx>) {
     // The lens must be a sane angle and there must be a canvas. (`tan(fov/2)` finite & > 0 rules
     // out a degenerate or ≥180° fov.)
     let tan_half = (camera.fov * 0.5).tan();
-    // A sane lens (0 < fov < π ⇒ tan(fov/2) finite & > 0) and a non-empty canvas.
     if !(camera.fov > 0.0 && camera.fov < std::f64::consts::PI && tan_half.is_finite())
         || area.width == 0
         || area.height == 0
     {
-        return (Vec::new(), RenderReport::default());
+        return (Vec::new(), RenderReport::default(), None);
     }
     let (built, dropped_frames) = build_tree(snap);
     let mut report = RenderReport {
@@ -382,12 +404,12 @@ pub fn project_points(
         ..RenderReport::default()
     };
     let Some((tree, ids)) = built else {
-        return (Vec::new(), report);
+        return (Vec::new(), report, None);
     };
     let Some(&cam_id) = ids.get(&camera.frame) else {
         // The eye's own frame isn't in the tree: nothing can be drawn — surface it loudly.
         report.unresolved_camera_frame = Some(camera.frame.clone());
-        return (Vec::new(), report);
+        return (Vec::new(), report, None);
     };
 
     // Pass 1 — frame composition (DESIGN.md §4.4 step 2), unchanged: resolve ONE transform per
@@ -454,7 +476,240 @@ pub fn project_points(
             });
         }
     }
+    let ctx = ViewCtx {
+        eye,
+        view,
+        tan_half,
+        half: w / 2.0,
+    };
+    (out, report, Some(ctx))
+}
+
+/// Which on-screen representation a body draws at, chosen by angular size (DESIGN.md §5.2). The
+/// DEM-mesh level is P2 (#26+) and out of scope here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lod {
+    /// Sub-resolution: a single sub-cell point.
+    Point,
+    /// Resolvable: a filled ellipse silhouette (true intensity shading is the color/graphics
+    /// backends, #20+).
+    Ellipsoid,
+}
+
+/// `Point → Ellipsoid` once the on-screen equatorial radius reaches this (cells, col metric).
+const LOD_GROW_CELLS: f64 = 1.5;
+/// `Ellipsoid → Point` once it shrinks below this (cells). Lower than [`LOD_GROW_CELLS`]: the gap
+/// is the **hysteresis** band, so a body whose size jitters across the boundary keeps its prior
+/// representation instead of flipping every frame (DESIGN §5.2). 0.75 ≈ the smallest disc that
+/// reads as more than a dot; the 2:1 band rides out a streaming producer's depth jitter.
+const LOD_SHRINK_CELLS: f64 = 0.75;
+
+/// Per-object LOD memory across frames — the hysteresis state. Deliberately **not** in the
+/// (immutable, lock-free) [`Snapshot`]/[`SceneStore`]: it is render-pass-local mutable state the
+/// host owns, one per live view, threaded into [`project_bodies`] each frame.
+#[derive(Clone, Debug, Default)]
+pub struct LodMemory {
+    prev: HashMap<ObjectId, Lod>,
+}
+
+impl LodMemory {
+    /// An empty memory (every body classifies fresh on the first frame).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Choose this frame's [`Lod`] for `id` from its on-screen radius and the previous frame's
+    /// choice, applying the grow/shrink hysteresis; records the result. With no prior, classify
+    /// against the band midpoint so the first frame is deterministic and centered.
+    fn select(&mut self, id: &ObjectId, screen_radius: f64) -> Lod {
+        let next = match self.prev.get(id) {
+            Some(Lod::Ellipsoid) => {
+                if screen_radius < LOD_SHRINK_CELLS {
+                    Lod::Point
+                } else {
+                    Lod::Ellipsoid
+                }
+            }
+            Some(Lod::Point) => {
+                if screen_radius >= LOD_GROW_CELLS {
+                    Lod::Ellipsoid
+                } else {
+                    Lod::Point
+                }
+            }
+            None => {
+                if screen_radius >= (LOD_GROW_CELLS + LOD_SHRINK_CELLS) * 0.5 {
+                    Lod::Ellipsoid
+                } else {
+                    Lod::Point
+                }
+            }
+        };
+        self.prev.insert(id.clone(), next);
+        next
+    }
+
+    /// Drop ids not seen this frame, so a removed/culled body neither leaks memory nor resurrects
+    /// a stale [`Lod`]. A body that briefly leaves the view loses its hysteresis state and
+    /// re-seeds from the band midpoint on return — acceptable, as an off-screen body has no
+    /// current size to hysterese against.
+    fn retain_seen(&mut self, seen: &HashSet<ObjectId>) {
+        self.prev.retain(|id, _| seen.contains(id));
+    }
+}
+
+/// An object projected into the viewport **with** its angular-size LOD resolved (DESIGN §5.2).
+/// Carries everything [`ProjectedPoint`] does plus the chosen [`Lod`] and the on-screen ellipse
+/// geometry (cells, col metric) for the [`Renderer`].
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct ProjectedBody {
+    /// Which object.
+    pub id: ObjectId,
+    /// Fractional cell column of the body centre (grows right).
+    pub col: f64,
+    /// Fractional cell row of the body centre (grows down).
+    pub row: f64,
+    /// Position in the camera frame (metres).
+    pub pos_cam: DVec3,
+    /// Body axes in camera-frame coordinates (see [`ProjectedPoint::att_cam`]).
+    pub att_cam: DMat3,
+    /// The representation chosen for this frame.
+    pub lod: Lod,
+    /// On-screen **equatorial** radius (cells) — the ellipse's semi-major axis (⟂ the projected
+    /// polar axis). Also the LOD selector's input.
+    pub screen_radius: f64,
+    /// On-screen semi-**minor** axis (cells), along the projected polar axis: `screen_radius` for
+    /// a sphere/pole-on view, shrinking to `screen_radius·r_pol/r_eq` edge-on.
+    pub semi_minor: f64,
+    /// Angle of the major axis from screen-right (radians, down-positive cell frame).
+    pub tilt: f64,
+}
+
+impl ProjectedBody {
+    /// The backend draw primitive for this body (DESIGN §5.1). `Point` LOD → a dot; `Ellipsoid`
+    /// LOD → the oriented filled ellipse.
+    #[must_use]
+    pub fn to_render_body(&self) -> RenderBody {
+        let kind = match self.lod {
+            Lod::Point => RenderKind::Point,
+            Lod::Ellipsoid => RenderKind::Ellipsoid {
+                semi_major: self.screen_radius,
+                semi_minor: self.semi_minor,
+                tilt: self.tilt,
+            },
+        };
+        RenderBody {
+            col: self.col,
+            row: self.row,
+            kind,
+        }
+    }
+}
+
+/// Project a snapshot's objects with **angular-size LOD** selection + hysteresis (DESIGN §5.2).
+/// Like [`project_points`] but classifies each *shaped* object [`Point`](Lod::Point) /
+/// [`Ellipsoid`](Lod::Ellipsoid) using `mem` (mutated in place — the cross-frame hysteresis
+/// state) and emits a [`ProjectedBody`] carrying the LOD + on-screen ellipse geometry. Shapeless
+/// objects are always points. Returns the same [`RenderReport`] as [`project_points`].
+#[must_use]
+pub fn project_bodies(
+    snap: &Snapshot,
+    camera: &Camera,
+    area: Rect,
+    mem: &mut LodMemory,
+) -> (Vec<ProjectedBody>, RenderReport) {
+    let (points, report, ctx) = project_core(snap, camera, area);
+    let Some(ctx) = ctx else {
+        return (Vec::new(), report);
+    };
+    // One pass to index shapes by id, so the per-body lookup below is O(1) (BodyShape is Copy).
+    let shapes: HashMap<ObjectId, BodyShape> = snap
+        .objects()
+        .iter()
+        .filter_map(|o| o.shape.map(|s| (o.id.clone(), s)))
+        .collect();
+
+    let mut seen = HashSet::with_capacity(points.len());
+    let mut out = Vec::with_capacity(points.len());
+    for p in points {
+        seen.insert(p.id.clone());
+        let shape = shapes.get(&p.id);
+        // Angular size: equatorial radius over the world width spanned by half the screen at this
+        // depth (reuses the projector's depth/tan_half/half — same metric as `project_perspective`).
+        let screen_radius = shape.map_or(0.0, |s| {
+            let depth = (p.pos_cam - ctx.eye).dot(ctx.view.forward);
+            if depth > 0.0 {
+                s.ellipsoid.r_eq() / (depth * ctx.tan_half) * ctx.half
+            } else {
+                0.0
+            }
+        });
+        let lod = mem.select(&p.id, screen_radius);
+        let (semi_minor, tilt) = match (lod, shape) {
+            (Lod::Ellipsoid, Some(s)) => {
+                oblate_silhouette(s, &p.att_cam, &ctx.view, p.pos_cam - ctx.eye, screen_radius)
+            }
+            // Point LOD (or shapeless): the ellipse fields are unused.
+            _ => (screen_radius, 0.0),
+        };
+        out.push(ProjectedBody {
+            id: p.id,
+            col: p.col,
+            row: p.row,
+            pos_cam: p.pos_cam,
+            att_cam: p.att_cam,
+            lod,
+            screen_radius,
+            semi_minor,
+            tilt,
+        });
+    }
+    mem.retain_seen(&seen);
     (out, report)
+}
+
+/// On-screen silhouette of an **oriented oblate spheroid**: an ellipse. Returns its semi-**minor**
+/// axis (cells, along the projected polar axis) and the major-axis `tilt` (radians, from
+/// screen-right in the down-positive cell frame). The semi-major axis is `screen_radius` (the
+/// equatorial radius, ⟂ the projected polar).
+///
+/// The outline of a spheroid `(r_eq, r_eq, r_pol)` viewed at angle `φ` between its polar axis and
+/// the line of sight has minor axis `r_eq·sqrt(1 − e²·sin²φ)` (e² = ellipsoid eccentricity²):
+/// pole-on (φ→0) → a circle; edge-on (φ→90°) → squashed to `r_eq·r_pol/r_eq = r_pol`.
+fn oblate_silhouette(
+    shape: &BodyShape,
+    att_cam: &DMat3,
+    view: &ViewBasis,
+    to_body: DVec3,
+    screen_radius: f64,
+) -> (f64, f64) {
+    // Body polar axis (body +Z) in camera coords, and the line of sight to the body.
+    let Some(polar) = (*att_cam * DVec3::Z).try_normalize() else {
+        return (screen_radius, 0.0);
+    };
+    let Some(ray) = to_body.try_normalize() else {
+        return (screen_radius, 0.0);
+    };
+    let cos_phi = polar.dot(ray);
+    let sin2_phi = (1.0 - cos_phi * cos_phi).max(0.0);
+    let semi_minor = screen_radius
+        * (1.0 - shape.ellipsoid.e_ellip_sq() * sin2_phi)
+            .max(0.0)
+            .sqrt();
+
+    // Project the polar axis onto the screen (down-positive cell frame: +up → −row). The major
+    // axis is perpendicular to it; if the polar axis is ~along the view (pole-on), the silhouette
+    // is ~circular and the tilt is irrelevant.
+    let px = polar.dot(view.right);
+    let py = -polar.dot(view.up);
+    let tilt = if px.hypot(py) < 1e-6 {
+        0.0
+    } else {
+        py.atan2(px) + std::f64::consts::FRAC_PI_2
+    };
+    (semi_minor, tilt)
 }
 
 /// A built frame arena: the astrodyn `FrameTree` plus the map from scene [`FrameUid`] to the
@@ -581,20 +836,90 @@ fn project_perspective(
     Some((col, row))
 }
 
-/// A rendering backend: rasterizes projected points into a ratatui [`Buffer`]. Backends
-/// (braille / color-cell / graphics — DESIGN.md §5.1) live in their own crates and
-/// implement this trait, keeping `astrotui-core` backend-agnostic.
-pub trait Renderer {
-    /// Draw `points` into `buf`, rasterizing at the backend's own resolution. Each point is
-    /// in fractional cell coordinates **local to `area`** (`(0, 0)` = the area's top-left,
-    /// as produced by [`project_points`]); the backend offsets by `area.x`/`area.y` when it
-    /// writes cells.
-    fn draw_points(&self, points: &[(f64, f64)], area: Rect, buf: &mut Buffer);
+/// One body to rasterize, its centre in fractional cell coordinates **local to the area**
+/// (`(0, 0)` = the area's top-left), as produced by [`project_bodies`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RenderBody {
+    /// Fractional cell column of the centre (grows right).
+    pub col: f64,
+    /// Fractional cell row of the centre (grows down).
+    pub row: f64,
+    /// What to draw at `(col, row)`.
+    pub kind: RenderKind,
 }
 
-/// The astrotui widget: projects a [`SceneStore`]'s latest snapshot through `camera` (a
-/// log-zoom perspective camera) and rasterizes it with `renderer`. The renderer is injected so
-/// the host picks the backend (capability-based auto-detect arrives in P3).
+/// The drawable form of a body at its chosen [`Lod`] (DESIGN §5.1). Semi-axes are in cells
+/// (col metric); the backend aspect-corrects rows for its own cell shape.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RenderKind {
+    /// Sub-resolution: a single sub-cell dot.
+    Point,
+    /// A filled ellipse silhouette. `semi_major` is the equatorial radius (⟂ the projected polar
+    /// axis); `semi_minor` is along the projected polar axis; `tilt` is the major-axis angle
+    /// (radians, from screen-right). A circle is `semi_major == semi_minor`. (#20 will shade this
+    /// same primitive per-cell.)
+    Ellipsoid {
+        /// Equatorial on-screen radius (cells).
+        semi_major: f64,
+        /// Polar-direction on-screen radius (cells).
+        semi_minor: f64,
+        /// Major-axis angle from screen-right (radians).
+        tilt: f64,
+    },
+}
+
+/// A rendering backend: rasterizes projected bodies into a ratatui [`Buffer`]. Backends
+/// (braille / color-cell / graphics — DESIGN.md §5.1) live in their own crates and implement this
+/// trait, keeping `astrotui-core` backend-agnostic.
+pub trait Renderer {
+    /// Draw `bodies` into `buf`, rasterizing at the backend's own resolution. Each body's centre
+    /// is in fractional cell coordinates **local to `area`**; the backend offsets by
+    /// `area.x`/`area.y` when it writes cells, and renders each [`RenderKind`] at its own fidelity
+    /// (braille → silhouette; color/graphics → shaded, #20+).
+    fn draw_bodies(&self, bodies: &[RenderBody], area: Rect, buf: &mut Buffer);
+
+    /// Draw bare points — a convenience for point-only callers. Default-implemented as degenerate
+    /// [`RenderKind::Point`] bodies fed to [`draw_bodies`](Renderer::draw_bodies), so a backend
+    /// only implements `draw_bodies`.
+    fn draw_points(&self, points: &[(f64, f64)], area: Rect, buf: &mut Buffer) {
+        let bodies: Vec<RenderBody> = points
+            .iter()
+            .map(|&(col, row)| RenderBody {
+                col,
+                row,
+                kind: RenderKind::Point,
+            })
+            .collect();
+        self.draw_bodies(&bodies, area, buf);
+    }
+}
+
+/// The stateful render state a [`SpaceView`] mutates each frame: the scene store plus the
+/// cross-frame LOD hysteresis [`LodMemory`]. The memory lives here (not in the lock-free
+/// `SceneStore`) because it is per-view render state — two cameras of one scene hysterese
+/// independently — and `SpaceView` is rebuilt per frame so it cannot hold it itself.
+#[derive(Default)]
+pub struct ViewState {
+    /// The scene to render.
+    pub scene: SceneStore,
+    /// Per-object LOD memory threaded across frames.
+    pub lod: LodMemory,
+}
+
+impl ViewState {
+    /// Wrap a [`SceneStore`] with fresh (empty) LOD memory.
+    #[must_use]
+    pub fn new(scene: SceneStore) -> Self {
+        Self {
+            scene,
+            lod: LodMemory::new(),
+        }
+    }
+}
+
+/// The astrotui widget: projects a [`ViewState`]'s latest snapshot through `camera` (a log-zoom
+/// perspective camera) with angular-size LOD and rasterizes it with `renderer`. The renderer is
+/// injected so the host picks the backend (capability-based auto-detect arrives in P3).
 pub struct SpaceView<'a> {
     camera: &'a Camera,
     renderer: &'a dyn Renderer,
@@ -609,17 +934,17 @@ impl<'a> SpaceView<'a> {
 }
 
 impl StatefulWidget for SpaceView<'_> {
-    type State = SceneStore;
+    type State = ViewState;
 
-    fn render(self, area: Rect, buf: &mut Buffer, state: &mut SceneStore) {
-        let snapshot = state.snapshot();
-        // The widget draws the projected points; a host that wants the unresolved-frame
-        // diagnostics (DESIGN §4.4) calls `project_points` directly and inspects the
-        // [`RenderReport`] (e.g. for a status line). The widget itself has no surface to
-        // show them on.
-        let (projected, _report) = project_points(&snapshot, self.camera, area);
-        let points: Vec<(f64, f64)> = projected.into_iter().map(|p| (p.col, p.row)).collect();
-        self.renderer.draw_points(&points, area, buf);
+    fn render(self, area: Rect, buf: &mut Buffer, state: &mut ViewState) {
+        let snapshot = state.scene.snapshot();
+        // The widget draws the LOD'd bodies; a host that wants the unresolved-frame diagnostics
+        // (DESIGN §4.4) calls `project_bodies` directly and inspects the [`RenderReport`] (e.g.
+        // for a status line). The widget itself has no surface to show them on.
+        let (bodies, _report) = project_bodies(&snapshot, self.camera, area, &mut state.lod);
+        let render_bodies: Vec<RenderBody> =
+            bodies.iter().map(ProjectedBody::to_render_body).collect();
+        self.renderer.draw_bodies(&render_bodies, area, buf);
     }
 }
 
@@ -861,6 +1186,122 @@ mod tests {
         assert_eq!((ahead.col, ahead.row), (10.0, 5.0));
     }
 
+    // ---- #19: angular-size LOD ----
+
+    // A unit-sphere body at the origin on the root frame; with `persp(root, dist)` its on-screen
+    // radius is `r_eq/(dist·tan20°)·(w/2) = 1/(dist·0.363970)·10 = 27.47474/dist` cells. So a
+    // target radius S → `dist = 27.47474/S`.
+    fn unit_sphere() -> astrodyn_planet::PlanetShape {
+        astrodyn_planet::PlanetShape::new("unit", 1.0, 1.0, 1.0, 0.0)
+    }
+    fn shaped_scene(shape: astrodyn_planet::PlanetShape) -> std::sync::Arc<crate::scene::Snapshot> {
+        let store = SceneStore::new();
+        let mut tx = store.writer("p").begin(Epoch::from_seconds(0.0));
+        tx.frame(root(), None, BodyState::default()).object(
+            "b",
+            root(),
+            at(0.0, 0.0),
+            ObjectMeta {
+                shape: Some(BodyShape::ellipsoid(shape)),
+                ..ObjectMeta::default()
+            },
+        );
+        tx.commit();
+        store.snapshot()
+    }
+    // `dist` giving on-screen radius `s` for the unit sphere in the 20×10 area.
+    fn dist_for(s: f64) -> f64 {
+        27.474_74 / s
+    }
+    fn lod_at(s: f64, mem: &mut LodMemory) -> Lod {
+        let (b, _) = project_bodies(
+            &shaped_scene(unit_sphere()),
+            &persp(root(), dist_for(s)),
+            area(),
+            mem,
+        );
+        b[0].lod
+    }
+
+    #[test]
+    fn lod_first_frame_uses_the_band_midpoint() {
+        // No prior → classify against (GROW+SHRINK)/2 = 1.125 cells.
+        assert_eq!(lod_at(1.3, &mut LodMemory::new()), Lod::Ellipsoid); // > 1.125
+        assert_eq!(lod_at(1.0, &mut LodMemory::new()), Lod::Point); // < 1.125
+    }
+
+    #[test]
+    fn lod_hysteresis_holds_inside_the_band() {
+        // Once an Ellipsoid, a size inside the band (0.75..1.5) does NOT drop back to Point.
+        let mut up = LodMemory::new();
+        assert_eq!(lod_at(2.0, &mut up), Lod::Ellipsoid); // grow
+        assert_eq!(lod_at(1.0, &mut up), Lod::Ellipsoid); // in band → stays Ellipsoid
+                                                          // Once a Point, a size inside the band does NOT grow to Ellipsoid.
+        let mut down = LodMemory::new();
+        assert_eq!(lod_at(0.4, &mut down), Lod::Point); // start small
+        assert_eq!(lod_at(1.0, &mut down), Lod::Point); // in band → stays Point
+    }
+
+    #[test]
+    fn lod_grows_and_shrinks_outside_the_band() {
+        let mut m = LodMemory::new();
+        assert_eq!(lod_at(0.4, &mut m), Lod::Point);
+        assert_eq!(lod_at(1.6, &mut m), Lod::Ellipsoid); // ≥ GROW (1.5)
+        assert_eq!(lod_at(0.5, &mut m), Lod::Point); // < SHRINK (0.75)
+    }
+
+    #[test]
+    fn shapeless_object_is_always_a_point() {
+        // A huge, close, shapeless object still resolves to a point (no shape → no angular size).
+        let snap = scene(&[("x", at(0.0, 0.0))]);
+        let (b, _) = project_bodies(&snap, &persp(root(), 100.0), area(), &mut LodMemory::new());
+        assert_eq!(b[0].lod, Lod::Point);
+    }
+
+    #[test]
+    fn lod_memory_prunes_objects_that_leave_the_scene() {
+        let mut m = LodMemory::new();
+        assert_eq!(lod_at(2.0, &mut m), Lod::Ellipsoid); // remembers "b" = Ellipsoid
+                                                         // A frame with the root frame but no objects prunes "b" (retain_seen drops unseen ids).
+        let empty = {
+            let store = SceneStore::new();
+            let mut tx = store.writer("p").begin(Epoch::from_seconds(0.0));
+            tx.frame(root(), None, BodyState::default());
+            tx.commit();
+            store.snapshot()
+        };
+        let _ = project_bodies(&empty, &persp(root(), 10.0), area(), &mut m);
+        // "b" reappears at a band size (1.0 < midpoint): if its stale Ellipsoid were kept it would
+        // stay Ellipsoid; pruned, it re-seeds from the midpoint → Point.
+        assert_eq!(lod_at(1.0, &mut m), Lod::Point);
+    }
+
+    #[test]
+    fn oblate_silhouette_is_circular_pole_on_and_squashed_equator_on() {
+        // Oblate spheroid: r_eq 2, r_pol 1 (flattening 0.5 → e² = 0.75, so minor = r_pol/r_eq = ½).
+        let shape =
+            BodyShape::ellipsoid(astrodyn_planet::PlanetShape::new("ob", 1.0, 2.0, 1.0, 0.5));
+        let view = ViewBasis {
+            right: DVec3::X,
+            up: DVec3::Y,
+            forward: DVec3::NEG_Z,
+        };
+        let ray = DVec3::NEG_Z; // body straight ahead along the view axis
+        let sr = 10.0;
+
+        // Pole-on: body polar axis (att_cam·Z) ∥ the ray → a circle, tilt irrelevant (0).
+        let (minor, tilt) = oblate_silhouette(&shape, &DMat3::IDENTITY, &view, ray, sr);
+        assert!((minor - sr).abs() < 1e-9);
+        assert_eq!(tilt, 0.0);
+
+        // Equator-on: rotate body +Z → camera +X (⟂ the ray) → minor squashed to sr·r_pol/r_eq,
+        // and the major axis is ⟂ the (horizontal) projected polar → vertical (π/2).
+        let eq = DMat3::from_rotation_y(std::f64::consts::FRAC_PI_2);
+        let (minor, tilt) = oblate_silhouette(&shape, &eq, &view, ray, sr);
+        assert!((minor - sr * 0.5).abs() < 1e-6, "minor {minor}");
+        assert!((tilt - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+    }
+
     #[test]
     fn one_transform_per_frame_applies_to_all_its_objects() {
         // Two objects share an offset child frame; each picks up that frame's transform.
@@ -970,12 +1411,14 @@ mod tests {
         assert_eq!(report.dropped_frames, vec![child()]);
     }
 
-    /// Records the points handed to a renderer, so we can check what `SpaceView` projected.
+    /// Records the body centres handed to a renderer, so we can check what `SpaceView` projected.
     #[derive(Default)]
     struct Recorder(std::cell::RefCell<Vec<(f64, f64)>>);
     impl Renderer for Recorder {
-        fn draw_points(&self, points: &[(f64, f64)], _area: Rect, _buf: &mut Buffer) {
-            self.0.borrow_mut().extend_from_slice(points);
+        fn draw_bodies(&self, bodies: &[RenderBody], _area: Rect, _buf: &mut Buffer) {
+            self.0
+                .borrow_mut()
+                .extend(bodies.iter().map(|b| (b.col, b.row)));
         }
     }
 
@@ -1163,7 +1606,7 @@ mod tests {
 
     #[test]
     fn space_view_projects_snapshot_to_the_renderer() {
-        let mut store = SceneStore::new();
+        let store = SceneStore::new();
         let mut tx = store.writer("p").begin(Epoch::from_seconds(0.0));
         tx.frame(root(), None, BodyState::default())
             .object("origin", root(), at(0.0, 0.0), ObjectMeta::default())
@@ -1174,7 +1617,8 @@ mod tests {
         let recorder = Recorder::default();
         let a = area();
         let mut buf = Buffer::empty(a);
-        SpaceView::new(&cam, &recorder).render(a, &mut buf, &mut store);
+        let mut state = ViewState::new(store);
+        SpaceView::new(&cam, &recorder).render(a, &mut buf, &mut state);
 
         let mut got = recorder.0.into_inner();
         got.sort_by(|x, y| x.0.total_cmp(&y.0));

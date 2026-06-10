@@ -5,9 +5,13 @@
 //! and ~4× vertical resolution over plain cells. Implements
 //! [`astrotui_core::render::Renderer`].
 
-use astrotui_core::render::Renderer;
+use astrotui_core::render::{RenderBody, RenderKind, Renderer};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+
+/// Braille cell height:width — terminal cells are ~2× taller than wide. Ellipse rows are divided
+/// by this so a silhouette that is round in the col metric renders round on screen.
+const CELL_ASPECT: f64 = 2.0;
 
 /// The braille point renderer — the `Renderer` capability floor (tui-globe style).
 #[derive(Clone, Copy, Debug, Default)]
@@ -22,26 +26,30 @@ impl BrailleRenderer {
 }
 
 impl Renderer for BrailleRenderer {
-    fn draw_points(&self, points: &[(f64, f64)], area: Rect, buf: &mut Buffer) {
+    fn draw_bodies(&self, bodies: &[RenderBody], area: Rect, buf: &mut Buffer) {
         let (w, h) = (area.width as usize, area.height as usize);
         if w == 0 || h == 0 {
             return;
         }
         // One accumulator byte per terminal cell, OR-ing in a bit per lit 2×4 sub-cell dot.
         let mut dots = vec![0u8; w * h];
-        for &(col, row) in points {
-            // Points are local to `area` ((0, 0) = top-left); the area offset is added when
-            // writing cells below.
-            let dx = col * 2.0;
-            let dy = row * 4.0;
-            if !dx.is_finite() || !dy.is_finite() || dx < 0.0 || dy < 0.0 {
-                continue;
+        for b in bodies {
+            match b.kind {
+                RenderKind::Point => plot_dot(&mut dots, w, h, b.col, b.row),
+                RenderKind::Ellipsoid {
+                    semi_major,
+                    semi_minor,
+                    tilt,
+                } => fill_ellipse(
+                    &mut dots,
+                    w,
+                    h,
+                    (b.col, b.row),
+                    semi_major,
+                    semi_minor,
+                    tilt,
+                ),
             }
-            let (dx, dy) = (dx as usize, dy as usize);
-            if dx >= w * 2 || dy >= h * 4 {
-                continue;
-            }
-            dots[(dy / 4) * w + dx / 2] |= braille_bit(dx % 2, dy % 4);
         }
         for cy in 0..h {
             for cx in 0..w {
@@ -53,6 +61,61 @@ impl Renderer for BrailleRenderer {
                 }
             }
         }
+    }
+}
+
+/// OR one sub-cell dot at fractional `(col, row)` (local to the area) into the accumulator.
+/// Non-finite / negative / out-of-grid coordinates are ignored (never panic).
+fn plot_dot(dots: &mut [u8], w: usize, h: usize, col: f64, row: f64) {
+    let dx = col * 2.0;
+    let dy = row * 4.0;
+    if !dx.is_finite() || !dy.is_finite() || dx < 0.0 || dy < 0.0 {
+        return;
+    }
+    let (dx, dy) = (dx as usize, dy as usize);
+    if dx >= w * 2 || dy >= h * 4 {
+        return;
+    }
+    dots[(dy / 4) * w + dx / 2] |= braille_bit(dx % 2, dy % 4);
+}
+
+/// Rasterize a filled, oriented ellipse silhouette centred at `(cx, cy)` into the accumulator.
+/// Semi-axes `(a, b)` are in **col** cells (`a` = major, along `tilt`; `b` = minor); rows are
+/// aspect-corrected by [`CELL_ASPECT`] so a round silhouette renders round. Sampled at braille
+/// sub-cell resolution (½ cell wide, ¼ cell tall). A circle (`a == b`, `tilt == 0`) reduces to a
+/// plain filled disc.
+fn fill_ellipse(
+    dots: &mut [u8],
+    w: usize,
+    h: usize,
+    center: (f64, f64),
+    a: f64,
+    b: f64,
+    tilt: f64,
+) {
+    let (cx, cy) = center;
+    if !(a > 0.0 && b > 0.0 && cx.is_finite() && cy.is_finite() && tilt.is_finite()) {
+        return;
+    }
+    let (sin_t, cos_t) = tilt.sin_cos();
+    let rcol = a.max(b); // bounding half-extent in col cells
+    let rrow = rcol / CELL_ASPECT;
+    let mut col = cx - rcol;
+    while col <= cx + rcol {
+        let mut row = cy - rrow;
+        while row <= cy + rrow {
+            let dx = col - cx;
+            // Back to the square col-metric space (down +), then rotate the sample into the
+            // ellipse's own axes and normalize by each semi-axis.
+            let dy = (row - cy) * CELL_ASPECT;
+            let u = (dx * cos_t + dy * sin_t) / a;
+            let v = (-dx * sin_t + dy * cos_t) / b;
+            if u * u + v * v <= 1.0 {
+                plot_dot(dots, w, h, col, row);
+            }
+            row += 0.25;
+        }
+        col += 0.5;
     }
 }
 
@@ -134,5 +197,101 @@ mod tests {
         let buf = render(&[(0.0, 0.0)], a);
         assert_eq!(glyph(&buf, 2, 1), "\u{2801}");
         assert_eq!(glyph(&buf, 4, 2), " "); // another in-area cell, untouched
+    }
+
+    // ---- #19: ellipse silhouette ----
+
+    fn render_bodies(bodies: &[RenderBody], area: Rect) -> Buffer {
+        let mut buf = Buffer::empty(area);
+        BrailleRenderer::new().draw_bodies(bodies, area, &mut buf);
+        buf
+    }
+    fn lit(buf: &Buffer, area: Rect) -> Vec<(u16, u16)> {
+        let mut v = Vec::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if buf[(area.x + x, area.y + y)].symbol() != " " {
+                    v.push((x, y));
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn fill_ellipse_circle_is_aspect_corrected() {
+        // A circle (semi_major == semi_minor = 4 cells) at the centre of a 20×10 area. Because
+        // braille cells are 2:1, a round silhouette spans ~2·r cols but ~r rows (≈ 2r/CELL_ASPECT).
+        let a = Rect::new(0, 0, 20, 10);
+        let body = RenderBody {
+            col: 10.0,
+            row: 5.0,
+            kind: RenderKind::Ellipsoid {
+                semi_major: 4.0,
+                semi_minor: 4.0,
+                tilt: 0.0,
+            },
+        };
+        let cells = lit(&render_bodies(&[body], a), a);
+        let span = |it: Vec<u16>| *it.iter().max().unwrap() - *it.iter().min().unwrap();
+        let col_span = span(
+            cells
+                .iter()
+                .filter(|(_, y)| *y == 5)
+                .map(|(x, _)| *x)
+                .collect(),
+        );
+        let row_span = span(
+            cells
+                .iter()
+                .filter(|(x, _)| *x == 10)
+                .map(|(_, y)| *y)
+                .collect(),
+        );
+        assert!((7..=9).contains(&col_span), "col span {col_span} ≈ 2·4");
+        assert!(
+            (3..=5).contains(&row_span),
+            "row span {row_span} ≈ 2·4/CELL_ASPECT"
+        );
+    }
+
+    #[test]
+    fn ellipsoid_fills_more_than_a_point() {
+        let a = Rect::new(0, 0, 20, 10);
+        let centre = (10.0, 5.0);
+        let point = RenderBody {
+            col: centre.0,
+            row: centre.1,
+            kind: RenderKind::Point,
+        };
+        let disc = RenderBody {
+            col: centre.0,
+            row: centre.1,
+            kind: RenderKind::Ellipsoid {
+                semi_major: 3.0,
+                semi_minor: 3.0,
+                tilt: 0.0,
+            },
+        };
+        assert_eq!(lit(&render_bodies(&[point], a), a).len(), 1); // a point lights one cell
+        assert!(lit(&render_bodies(&[disc], a), a).len() > 10); // a disc lights many
+    }
+
+    #[test]
+    fn oblate_ellipse_silhouette_golden() {
+        // A tilted oblate ellipse (major 5, minor 2.5, tilt 30°) — a golden frame locks the
+        // oriented, aspect-corrected rasterization (CLAUDE.md: prefer insta + buffer_to_text).
+        let a = Rect::new(0, 0, 18, 9);
+        let body = RenderBody {
+            col: 9.0,
+            row: 4.5,
+            kind: RenderKind::Ellipsoid {
+                semi_major: 5.0,
+                semi_minor: 2.5,
+                tilt: std::f64::consts::FRAC_PI_6,
+            },
+        };
+        let buf = render_bodies(&[body], a);
+        insta::assert_snapshot!(astrotui_core::testing::buffer_to_text(&buf));
     }
 }

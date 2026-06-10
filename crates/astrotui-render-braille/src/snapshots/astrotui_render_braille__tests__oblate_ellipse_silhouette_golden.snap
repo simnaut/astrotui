@@ -1,0 +1,11 @@
+---
+source: crates/astrotui-render-braille/src/lib.rs
+expression: "astrotui_core::testing::buffer_to_text(&buf)"
+---
+                  
+                  
+                  
+     ⣾⣿⣿⣷⣶⣤⡀      
+     ⠻⣿⣿⣿⣿⣿⣿⣦⡀    
+      ⠈⠻⢿⣿⣿⣿⣿⡇    
+          ⠉⠉⠉

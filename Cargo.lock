@@ -123,6 +123,8 @@ name = "astrotui-render-color"
 version = "0.0.0"
 dependencies = [
  "astrotui-core",
+ "insta",
+ "ratatui",
 ]
 
 [[package]]

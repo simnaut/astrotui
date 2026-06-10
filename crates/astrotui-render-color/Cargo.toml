@@ -9,6 +9,11 @@ description = "24-bit color half-block rendering backend for astrotui (dithered 
 
 [dependencies]
 astrotui-core = { workspace = true }
+ratatui = { workspace = true }
+
+[dev-dependencies]
+# Golden-frame shading tests (insta snapshots over a luminance ramp dump).
+insta = "1"
 
 [lints]
 workspace = true

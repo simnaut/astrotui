@@ -571,6 +571,119 @@ mod tests {
         );
     }
 
+    // #23 — the P2 entry proof: a *producer-supplied* Moon ME frame (DESIGN.md §6 step 1)
+    // is consumed as an ordinary frame node, and rotation **updates across epochs**
+    // re-resolve the render tree. The ME identity is the stable `PlanetFixed<Moon>` mint —
+    // `MoonMeDe421` is the producer-side orientation convention riding in the rotation
+    // values, never a special-cased identity. A Taurus-Littrow site marker rides the frame:
+    // it must hold still under `Camera::body_fixed::<Moon>()` while sweeping under the root
+    // overview as the Moon turns — camera = frame, zero Moon-specific consume code.
+    #[test]
+    fn moon_me_frame_updates_re_resolve_against_cameras() {
+        use astrotui_core::render::{project_points, Camera, LogZoom};
+        use astrotui_core::scene::{ObjectMeta, Snapshot};
+        use ratatui::layout::Rect;
+        use std::f64::consts::FRAC_1_SQRT_2;
+
+        // The producer's ME transform per epoch (recomputed producer-side per DESIGN.md §6
+        // step 1; no ephemeris here): Moon at `moon_pos` (root metres), spun about its pole
+        // (+z) by 0° at t₀ and +90° at t₁ — exact quats so expectations are hand-typed.
+        let moon_pos = [3.84e8, 0.0, 0.0];
+        let spin90 = CanonicalRotation::Quat([FRAC_1_SQRT_2, 0.0, 0.0, FRAC_1_SQRT_2]);
+        let mut b = SeriesBuilder::new(header(), vec![root_uid(), child_uid()]);
+        b.push_epoch(
+            100.0,
+            vec![
+                rec("root", 0, None, 100.0, [0.0; 3], ident()),
+                rec("moon_me", 1, Some(0), 100.0, moon_pos, ident()),
+            ],
+        );
+        b.push_epoch(
+            200.0,
+            vec![
+                rec("root", 0, None, 200.0, [0.0; 3], ident()),
+                rec("moon_me", 1, Some(0), 200.0, moon_pos, spin90),
+            ],
+        );
+        let series = b.finish();
+
+        // A surface site riding the ME frame: Taurus-Littrow (DEM.md §2) on the 1737.4 km
+        // sphere (DEM.md §3) — ME-frame Cartesian from planetocentric lat/lon.
+        let (lat, lon) = (20.19_f64.to_radians(), 30.77_f64.to_radians());
+        let r = 1_737_400.0;
+        let site = DVec3::new(
+            r * lat.cos() * lon.cos(),
+            r * lat.cos() * lon.sin(),
+            r * lat.sin(),
+        );
+
+        let store = SceneStore::new();
+        let writer = store.writer("obj");
+        let mut tx = writer.begin(Epoch::from_seconds(100.0));
+        tx.object(
+            "site",
+            child_uid(),
+            BodyState {
+                position: site,
+                velocity: DVec3::ZERO,
+                attitude: DQuat::IDENTITY,
+            },
+            ObjectMeta::default(),
+        );
+        tx.commit();
+
+        fn site_pos(snap: &Snapshot, cam: &Camera) -> DVec3 {
+            let (pts, report) = project_points(snap, cam, Rect::new(0, 0, 400, 400));
+            assert!(
+                report.is_clean(),
+                "ME scene must resolve cleanly: {report:?}"
+            );
+            pts.iter()
+                .find(|p| p.id.as_str() == "site")
+                .expect("site present")
+                .pos_cam
+        }
+        // The overview must dolly out to interplanetary range or the Moon-distance site
+        // falls outside the default near-orbit frustum and is culled as off-screen.
+        let mut overview = Camera::overview(root_uid());
+        overview.zoom = LogZoom::from_distance(1.5e9);
+        let body_fixed = Camera::body_fixed::<Moon>();
+
+        // t₀ (identity spin): root view sees moon_pos + site; the body-fixed camera sees
+        // the site's ME coordinates pass through untouched (camera = frame).
+        apply_series_epoch(&series, 0, 0, &mut store.writer("wire")).unwrap();
+        let snap0 = store.snapshot();
+        let root0 = site_pos(&snap0, &overview);
+        let fixed0 = site_pos(&snap0, &body_fixed);
+        assert!(
+            root0.abs_diff_eq(DVec3::from_array(moon_pos) + site, 1e-6),
+            "t0 overview {root0:?}"
+        );
+        assert!(fixed0.abs_diff_eq(site, 1e-6), "t0 body-fixed {fixed0:?}");
+
+        // t₁: the producer re-ships the frame with +90° spin — only the frame layer
+        // changes; the object layer is untouched.
+        apply_series_epoch(&series, 0, 1, &mut store.writer("wire")).unwrap();
+        let snap1 = store.snapshot();
+        // Under the body-fixed camera the site has not moved at all…
+        let fixed1 = site_pos(&snap1, &body_fixed);
+        assert!(
+            fixed1.abs_diff_eq(fixed0, 1e-9),
+            "site must be frame-fixed: {fixed1:?} vs {fixed0:?}"
+        );
+        // …while in root coords it swept with the Moon. The #77-pinned convention maps
+        // child-x → root −y and child-y → root +x for a +90° doc spin.
+        let root1 = site_pos(&snap1, &overview);
+        let swept = DVec3::new(site.y, -site.x, site.z);
+        assert!(
+            root1.abs_diff_eq(DVec3::from_array(moon_pos) + swept, 1e-6),
+            "t1 overview {root1:?} != moon_pos + {swept:?}"
+        );
+        // The frame layer's epoch advanced with the update (staleness stays observable, #76).
+        let secs = snap1.epoch(&"wire".into()).map(|e| e.as_seconds());
+        assert_eq!(secs, Some(200.0));
+    }
+
     #[test]
     fn document_producer_populates() {
         let store = SceneStore::new();

@@ -12,8 +12,8 @@ use ratatui::layout::Rect;
 use ratatui::style::Color;
 
 /// Cell height:width — terminal cells are ~2× taller than wide. With two half-block
-/// pixels per cell, pixels come out ~square, so a silhouette that is round in the col
-/// metric renders round on screen.
+/// pixels per cell, pixels come out ~square, so a silhouette that is round in the
+/// col-metric renders round on screen.
 const CELL_ASPECT: f64 = 2.0;
 
 /// What a [`Shader`] sees for one covered pixel of an ellipsoid silhouette.
